@@ -83,6 +83,44 @@ warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+# kubectl wrapper + capture helpers
+#
+# kc()      — every kubectl call goes through here: read-only verbs only,
+#             always bounded by --request-timeout.
+# capture() — run a command, write stdout to a file inside the bundle,
+#             log stderr to collect-errors.log. A failure increments
+#             CAPTURE_FAILS (collector -> "partial") but never aborts.
+# ---------------------------------------------------------------------------
+
+ERRLOG=""            # $BUNDLE_DIR/collect-errors.log (set in setup_workdir)
+CAPTURE_FAILS=0      # reset by each collector
+
+kc() { kubectl --request-timeout=30s "$@"; }
+
+capture() {
+    # capture <bundle-relative-out-file> <command...>
+    local rel="$1"; shift
+    local out="$BUNDLE_DIR/$rel"
+    mkdir -p "$(dirname "$out")"
+    printf '### %s\n' "$*" >> "$ERRLOG"
+    if ! "$@" > "$out" 2>> "$ERRLOG"; then
+        CAPTURE_FAILS=$((CAPTURE_FAILS + 1))
+        printf '# command failed: %s\n# stderr: see collect-errors.log\n' "$*" >> "$out"
+        return 1
+    fi
+    return 0
+}
+
+# Node list is used by several collectors — fetch once.
+NODES_CACHE=""
+get_nodes() {
+    if [ -z "$NODES_CACHE" ]; then
+        NODES_CACHE="$(kc get nodes -o name 2>>"$ERRLOG" | sed 's|^node/||')"
+    fi
+    printf '%s\n' "$NODES_CACHE"
+}
+
+# ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
 
@@ -310,6 +348,9 @@ setup_workdir() {
     BUNDLE_DIR="$WORK_DIR/$BUNDLE_NAME"
     COLLECTOR_STATUS_FILE="$WORK_DIR/collector-status.txt"
     : > "$COLLECTOR_STATUS_FILE"
+    mkdir -p "$BUNDLE_DIR"
+    ERRLOG="$BUNDLE_DIR/collect-errors.log"
+    : > "$ERRLOG"
 
     local d
     for d in $COLLECTORS; do
@@ -330,10 +371,247 @@ record_collector() {
     printf '%s|%s|%s\n' "$1" "$2" "${3:-}" >> "$COLLECTOR_STATUS_FILE"
 }
 
-# --- Milestone 1: stubs only. Real collectors land in milestones 2-5. ------
+# ===========================================================================
+# cluster/ — versions, nodes, storage classes, distro + CNI hints
+# All commands: kubectl get / describe / version. Read-only.
+# ===========================================================================
 
-collect_cluster()  { record_collector cluster  not_implemented "milestone 2: versions, nodes, storage classes"; }
-collect_gpu()      { record_collector gpu      not_implemented "milestone 2: GPU labels, device plugin, nvidia-smi (best-effort)"; }
+collect_cluster() {
+    CAPTURE_FAILS=0
+
+    capture cluster/version.txt          kc version
+    capture cluster/nodes-wide.txt       kc get nodes -o wide
+    capture cluster/nodes-labels.txt     kc get nodes --show-labels
+    capture cluster/storageclasses.txt   kc get storageclass -o wide
+    # Full DaemonSet list: shows CNI, device plugin, DCGM, log agents — pure infra.
+    capture cluster/daemonsets-wide.txt  kc get daemonsets --all-namespaces -o wide
+
+    local node
+    for node in $(get_nodes); do
+        [ -n "$node" ] || continue
+        capture "cluster/nodes/describe-${node}.txt" kc describe node "$node"
+    done
+
+    write_distro_hints
+    write_cni_hints
+
+    if [ "$CAPTURE_FAILS" -eq 0 ]; then
+        record_collector cluster ok ""
+    else
+        record_collector cluster partial "$CAPTURE_FAILS command(s) failed; see collect-errors.log"
+    fi
+}
+
+write_distro_hints() {
+    # Heuristics only — grep version strings + node labels for known markers.
+    local out="$BUNDLE_DIR/cluster/distro-hint.txt"
+    local haystack
+    haystack="$(cat "$BUNDLE_DIR/cluster/version.txt" "$BUNDLE_DIR/cluster/nodes-labels.txt" 2>/dev/null)"
+    {
+        echo "# Heuristic Kubernetes distro/flavour hints"
+        echo "# (matched against kubectl version output + node labels)"
+        local found=false
+        case "$haystack" in *k3s*)                          echo "k3s";        found=true ;; esac
+        case "$haystack" in *rke2*)                         echo "RKE2";       found=true ;; esac
+        case "$haystack" in *-eks-*|*amazonaws.com*)        echo "EKS";        found=true ;; esac
+        case "$haystack" in *-gke.*|*cloud.google.com*)     echo "GKE";        found=true ;; esac
+        case "$haystack" in *kubernetes.azure.com*)         echo "AKS";        found=true ;; esac
+        case "$haystack" in *node.openshift.io*)            echo "OpenShift";  found=true ;; esac
+        case "$haystack" in *microk8s*)                     echo "MicroK8s";   found=true ;; esac
+        case "$haystack" in *talos.dev*)                    echo "Talos";      found=true ;; esac
+        $found || echo "no known distro markers found (likely vanilla Kubernetes)"
+    } > "$out"
+}
+
+write_cni_hints() {
+    local out="$BUNDLE_DIR/cluster/cni-hint.txt"
+    local ds_file="$BUNDLE_DIR/cluster/daemonsets-wide.txt"
+    {
+        echo "# CNI hints: DaemonSets matching known CNI names"
+        if [ -f "$ds_file" ]; then
+            grep -iE 'calico|cilium|flannel|weave|antrea|kube-ovn|multus|canal|kube-router|aws-node|azure-cni' \
+                "$ds_file" 2>/dev/null || echo "no known CNI DaemonSet names matched"
+        else
+            echo "daemonset list unavailable"
+        fi
+    } > "$out"
+}
+
+# ===========================================================================
+# gpu/ — node GPU labels/capacity, device plugin, GPU Operator, nvidia-smi,
+# DCGM metrics. nvidia-smi uses a READ-ONLY exec (query tool, changes
+# nothing); DCGM uses a read-only GET through the API server's pod proxy.
+# Everything beyond node labels is best-effort — never fails the run.
+# ===========================================================================
+
+GPU_NOTES=""
+
+gpu_note() { GPU_NOTES="${GPU_NOTES:+$GPU_NOTES; }$1"; }
+
+collect_gpu() {
+    CAPTURE_FAILS=0
+    GPU_NOTES=""
+
+    # Working file only — the full cluster pod list stays OUT of the bundle
+    # (it would leak names of unrelated workloads). Only GPU-stack-filtered
+    # lines are included below.
+    local all_pods="$WORK_DIR/all-pods-wide.txt"
+    kc get pods --all-namespaces -o wide > "$all_pods" 2>>"$ERRLOG" || true
+
+    write_gpu_node_info
+
+    grep -iE 'nvidia|dcgm|gpu-operator|gpu-feature-discovery|node-feature-discovery' \
+        "$all_pods" > "$BUNDLE_DIR/gpu/gpu-stack-pods.txt" 2>/dev/null \
+        || echo "no NVIDIA / GPU Operator / NFD pods found" > "$BUNDLE_DIR/gpu/gpu-stack-pods.txt"
+
+    collect_device_plugin "$all_pods"
+    collect_gpu_operator
+    collect_nvidia_smi "$all_pods"
+    collect_dcgm_metrics "$all_pods"
+
+    if [ "$CAPTURE_FAILS" -eq 0 ]; then
+        record_collector gpu ok "$GPU_NOTES"
+    else
+        record_collector gpu partial "$CAPTURE_FAILS command(s) failed; $GPU_NOTES"
+    fi
+}
+
+write_gpu_node_info() {
+    local out="$BUNDLE_DIR/gpu/gpu-nodes.txt"
+    local node cap alloc labels gpu_nodes=0
+    : > "$out"
+    for node in $(get_nodes); do
+        [ -n "$node" ] || continue
+        cap="$(kc get node "$node" -o jsonpath='{.status.capacity.nvidia\.com/gpu}' 2>>"$ERRLOG")"
+        alloc="$(kc get node "$node" -o jsonpath='{.status.allocatable.nvidia\.com/gpu}' 2>>"$ERRLOG")"
+        [ -n "$cap" ] && gpu_nodes=$((gpu_nodes + 1))
+        # Labels from GPU Operator / Node Feature Discovery carry the driver,
+        # CUDA and MIG story: nvidia.com/gpu.product, nvidia.com/cuda.driver.*
+        labels="$(kc get node "$node" -o jsonpath='{.metadata.labels}' 2>>"$ERRLOG" \
+            | tr ',{}' '\n\n\n' | grep -iE 'nvidia|gpu|cuda|mig' | sed -e 's/"//g' -e 's/^[[:space:]]*/  /')"
+        {
+            printf '== node: %s\n' "$node"
+            printf 'nvidia.com/gpu capacity   : %s\n' "${cap:-<none>}"
+            printf 'nvidia.com/gpu allocatable: %s\n' "${alloc:-<none>}"
+            printf 'GPU-related labels:\n'
+            if [ -n "$labels" ]; then printf '%s\n' "$labels"; else printf '  <none>\n'; fi
+            printf '\n'
+        } >> "$out"
+    done
+    if [ ! -s "$out" ]; then
+        echo "node list unavailable" > "$out"
+        CAPTURE_FAILS=$((CAPTURE_FAILS + 1))
+    fi
+    gpu_note "$gpu_nodes node(s) with nvidia.com/gpu capacity"
+}
+
+collect_device_plugin() {
+    local all_pods="$1"
+    local ds_file="$BUNDLE_DIR/cluster/daemonsets-wide.txt"
+    local ns name pod
+
+    # DaemonSet spec/status (matched by name; covers standalone + operator installs)
+    if [ -f "$ds_file" ]; then
+        while read -r ns name; do
+            [ -n "$name" ] || continue
+            capture "gpu/device-plugin/describe-${ns}-${name}.txt" kc describe daemonset -n "$ns" "$name"
+        done <<EOF
+$(awk 'tolower($2) ~ /device-plugin/ && tolower($0) ~ /nvidia/ { print $1, $2 }' "$ds_file")
+EOF
+    fi
+
+    # Bounded logs from up to 3 device plugin pods (one per node otherwise —
+    # a large cluster would bloat the bundle for no extra signal).
+    while read -r ns pod; do
+        [ -n "$pod" ] || continue
+        capture "gpu/device-plugin/logs-${ns}-${pod}.txt" kc logs -n "$ns" "$pod" --tail="$TAIL_LINES"
+    done <<EOF
+$(awk '$2 ~ /nvidia-device-plugin/ && $4 == "Running" { print $1, $2 }' "$all_pods" 2>/dev/null | head -3)
+EOF
+}
+
+collect_gpu_operator() {
+    local out="$BUNDLE_DIR/gpu/clusterpolicy.yaml"
+    # ClusterPolicy CRD exists only when the NVIDIA GPU Operator is installed.
+    if kc get crd clusterpolicies.nvidia.com >/dev/null 2>&1; then
+        capture gpu/clusterpolicy.yaml kc get clusterpolicies.nvidia.com -o yaml
+        gpu_note "GPU Operator ClusterPolicy present"
+    else
+        echo "NVIDIA GPU Operator not detected (no clusterpolicies.nvidia.com CRD)" > "$out"
+        gpu_note "no GPU Operator"
+    fi
+}
+
+collect_nvidia_smi() {
+    local all_pods="$1"
+    local out="$BUNDLE_DIR/gpu/nvidia-smi.txt"
+    local cands="$WORK_DIR/nvidia-smi-candidates.txt"
+    local tmp="$WORK_DIR/nvidia-smi.tmp"
+    local ns pod tried=0 max_tries=4
+
+    # Candidate pods, best first: GPU pods in the target namespace, then
+    # driver DaemonSet pods, then device plugin pods.
+    {
+        kc get pods -n "$NAMESPACE" \
+            -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.containers[*].resources.limits.nvidia\.com/gpu}{"\n"}{end}' \
+            2>>"$ERRLOG" | awk '$3 != "" { print $1, $2 }'
+        awk '$4 == "Running" && $2 ~ /nvidia-driver-daemonset/ { print $1, $2 }' "$all_pods" 2>/dev/null
+        awk '$4 == "Running" && $2 ~ /nvidia-device-plugin/    { print $1, $2 }' "$all_pods" 2>/dev/null
+    } > "$cands"
+
+    while read -r ns pod; do
+        [ -n "$pod" ] || continue
+        tried=$((tried + 1))
+        [ "$tried" -gt "$max_tries" ] && break
+        # READ-ONLY exec: nvidia-smi is a query tool; this mutates nothing.
+        printf '### kc exec -n %s %s -- nvidia-smi (best-effort)\n' "$ns" "$pod" >> "$ERRLOG"
+        if kc exec -n "$ns" "$pod" -- nvidia-smi > "$tmp" 2>>"$ERRLOG"; then
+            {
+                printf '# nvidia-smi via read-only exec in pod %s/%s\n' "$ns" "$pod"
+                cat "$tmp"
+            } > "$out"
+            gpu_note "nvidia-smi ok via $ns/$pod"
+            return 0
+        fi
+    done < "$cands"
+
+    echo "nvidia-smi unavailable: no candidate pod succeeded ($tried tried). Not fatal — GPU node labels above usually carry driver/CUDA versions." > "$out"
+    gpu_note "nvidia-smi unavailable ($tried candidate(s) tried)"
+}
+
+collect_dcgm_metrics() {
+    local all_pods="$1"
+    local out="$BUNDLE_DIR/gpu/dcgm-metrics.txt"
+    local tmp="$WORK_DIR/dcgm.tmp"
+    local line ns pod port max_bytes=262144
+
+    line="$(awk '$4 == "Running" && $2 ~ /dcgm/ { print $1, $2; exit }' "$all_pods" 2>/dev/null)"
+    if [ -z "$line" ]; then
+        echo "no running dcgm-exporter pod found" > "$out"
+        gpu_note "no DCGM exporter"
+        return 0
+    fi
+    ns="${line%% *}"
+    pod="${line##* }"
+    port="$(kc get pod -n "$ns" "$pod" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>>"$ERRLOG")"
+    port="${port:-9400}"
+
+    # Read-only GET through the API server's pod proxy — no exec, no mutation.
+    if kc get --raw "/api/v1/namespaces/${ns}/pods/${pod}:${port}/proxy/metrics" > "$tmp" 2>>"$ERRLOG"; then
+        {
+            printf '# DCGM metrics from %s/%s:%s (read-only GET via pod proxy)\n' "$ns" "$pod" "$port"
+            head -c "$max_bytes" "$tmp"
+            [ "$(wc -c < "$tmp")" -gt "$max_bytes" ] && printf '\n# [truncated at %s bytes]\n' "$max_bytes"
+        } > "$out"
+        gpu_note "DCGM metrics ok via $ns/$pod"
+    else
+        echo "dcgm-exporter found ($ns/$pod) but /metrics not reachable via pod proxy on port $port" > "$out"
+        gpu_note "DCGM /metrics unreachable"
+    fi
+}
+
+# --- Milestones 3-5: stubs. ------------------------------------------------
+
 collect_workload() { record_collector workload not_implemented "milestone 3: serving workload spec, helm, serving-engine config"; }
 collect_state()    { record_collector state    not_implemented "milestone 4: events, pod status, OOMKill/CrashLoop detection"; }
 collect_logs()     { record_collector logs     not_implemented "milestone 4: bounded logs, current + previous containers"; }
