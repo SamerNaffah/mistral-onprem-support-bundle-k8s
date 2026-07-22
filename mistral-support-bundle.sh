@@ -610,9 +610,272 @@ collect_dcgm_metrics() {
     fi
 }
 
-# --- Milestones 3-5: stubs. ------------------------------------------------
+# ===========================================================================
+# workload/ — the Mistral serving deployment: spec, images (-> model+version),
+# serving-engine config (TP size, max-model-len, quant, ...), Helm release
+# values/manifest, and the ConfigMaps/Secrets it references.
+#
+# PRIVACY (enforced HERE, at collection time — not left to the milestone-6
+# regex net):
+#   - Env var VALUES are WIPED by default. A value survives only if its name is
+#     in WORKLOAD_ENV_ALLOWLIST below (audited, non-sensitive serving knobs).
+#   - Secret VALUES are never read. Only secret names, types, and key names.
+#   - valueFrom refs never expose the resolved value.
+# Helm values/manifest and referenced ConfigMaps are config (may carry tokens);
+# they are collected here and scrubbed by the regex safety net in milestone 6.
+# All commands are read-only: kubectl get / helm get/list.
+# ===========================================================================
 
-collect_workload() { record_collector workload not_implemented "milestone 3: serving workload spec, helm, serving-engine config"; }
+# Env var NAMES whose VALUES are safe to keep (non-sensitive serving / tuning
+# parameters). Every other env value is wiped to "<REDACTED>". Keep this list
+# short, explicit and easy for a security reviewer to read top to bottom.
+# Covers both the Mistral inference-engine chart's env (SERVED_MODEL, TP_SIZE,
+# RECIPES_VERSION, VLLM_*) and generic vLLM/TGI-style tuning knobs.
+WORKLOAD_ENV_ALLOWLIST="
+SERVED_MODEL SERVED_MODEL_NAME MODEL MODEL_NAME MODEL_CONFIGS_FILENAME
+RECIPES_VERSION RECIPE_EXTRA_ARGS
+LLM_ENGINE ENGINE
+TP_SIZE TENSOR_PARALLEL_SIZE PP_SIZE PIPELINE_PARALLEL_SIZE
+MAX_MODEL_LEN MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS
+GPU_MEMORY_UTILIZATION KV_CACHE_DTYPE BLOCK_SIZE SWAP_SPACE
+QUANTIZATION DTYPE ENFORCE_EAGER TRUST_REMOTE_CODE
+VLLM_EXTRA_ARGS VLLM_LOGGING_LEVEL VLLM_ALLOW_LONG_MAX_MODEL_LEN
+VLLM_WORKER_MULTIPROC_METHOD VLLM_USE_V1
+NATS_URL TRITON_CACHE_DIR RCLONE_CONFIG_PATH
+PORT HOST
+"
+
+WL_NOTES=""
+
+collect_workload() {
+    CAPTURE_FAILS=0
+    WL_NOTES=""
+    local wl_list count=0 kind name label
+
+    # Release-level context first (independent of workload auto-detection).
+    collect_helm
+
+    wl_list="$(find_gpu_workloads)"
+
+    if [ -z "$wl_list" ]; then
+        # No GPU Deployment/StatefulSet found. Record what workloads DO exist
+        # (names only — safe) so support still has a starting point.
+        {
+            echo "# No Deployment/StatefulSet requesting nvidia.com/gpu was found"
+            echo "# in namespace '$NAMESPACE'. Workloads present (names only):"
+            echo
+            kc get deployment,statefulset,daemonset -n "$NAMESPACE" -o name 2>>"$ERRLOG"
+        } > "$BUNDLE_DIR/workload/no-gpu-workload.txt"
+        WL_NOTES="no GPU workload auto-detected in $NAMESPACE"
+        record_collector workload partial "$WL_NOTES"
+        return 0
+    fi
+
+    # bash 3.2: iterate via while-read over a heredoc (no mapfile).
+    while read -r kind name; do
+        [ -n "$name" ] || continue
+        count=$((count + 1))
+        label="$(printf '%s-%s' "$kind" "$name" | tr -c 'A-Za-z0-9._-' '-')"
+        write_workload_spec   "$kind" "$name" "$label"
+        write_workload_env    "$kind" "$name" "$label"
+        collect_workload_refs "$kind" "$name" "$label"
+        write_serving_config  "$label"
+    done <<EOF
+$wl_list
+EOF
+
+    WL_NOTES="$count GPU workload(s): $(printf '%s\n' "$wl_list" | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')"
+    if [ "$CAPTURE_FAILS" -eq 0 ]; then
+        record_collector workload ok "$WL_NOTES"
+    else
+        record_collector workload partial "$CAPTURE_FAILS capture(s) failed; $WL_NOTES"
+    fi
+}
+
+find_gpu_workloads() {
+    # Emit "<kind> <name>" for Deployments/StatefulSets in $NAMESPACE whose pod
+    # template requests OR limits nvidia.com/gpu. Read-only.
+    local kind
+    for kind in deployment statefulset; do
+        kc get "$kind" -n "$NAMESPACE" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.template.spec.containers[*].resources.limits.nvidia\.com/gpu}{"\t"}{.spec.template.spec.containers[*].resources.requests.nvidia\.com/gpu}{"\n"}{end}' \
+            2>>"$ERRLOG" \
+        | awk -F'\t' -v k="$kind" '($2 != "" || $3 != "") { print k, $1 }'
+    done
+}
+
+write_workload_spec() {
+    local kind="$1" name="$2" label="$3"
+    local d="$BUNDLE_DIR/workload/$label"
+    mkdir -p "$d"
+    {
+        printf '# Workload spec (redacted) — %s/%s in namespace %s\n' "$kind" "$name" "$NAMESPACE"
+        printf '# Env values are wiped at collection time; see env-redacted.txt.\n\n'
+
+        printf 'kind             : %s\n' "$kind"
+        printf 'name             : %s\n' "$name"
+        printf 'namespace        : %s\n' "$NAMESPACE"
+        printf 'helm release     : %s\n' "$(kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/instance}' 2>>"$ERRLOG")"
+        printf 'app name (label) : %s\n' "$(kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{.metadata.labels.app\.kubernetes\.io/name}' 2>>"$ERRLOG")"
+        printf 'helm chart       : %s\n' "$(kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{.metadata.labels.helm\.sh/chart}' 2>>"$ERRLOG")"
+        printf 'replicas (spec)  : %s\n' "$(kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>>"$ERRLOG")"
+        printf 'replicas (ready) : %s\n' "$(kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' 2>>"$ERRLOG")"
+
+        printf '\n[images]  (tag/digest -> engine + model version)\n'
+        kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{range .spec.template.spec.initContainers[*]}  init/{.name}: {.image}{"\n"}{end}{range .spec.template.spec.containers[*]}  {.name}: {.image}{"\n"}{end}' 2>>"$ERRLOG"
+
+        printf '\n[resources]\n'
+        kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{range .spec.template.spec.containers[*]}  {.name}: requests={.resources.requests}  limits={.resources.limits}{"\n"}{end}' 2>>"$ERRLOG"
+
+        printf '\n[ports]\n'
+        kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{range .spec.template.spec.containers[*]}  {.name}: {range .ports[*]}{.name}:{.containerPort}/{.protocol} {end}{"\n"}{end}' 2>>"$ERRLOG"
+
+        printf '\n[command]\n'
+        kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{range .spec.template.spec.containers[*]}  == {.name}{"\n"}{range .command[*]}    {@}{"\n"}{end}{end}' 2>>"$ERRLOG"
+
+        printf '\n[container args]  (serving-engine CLI flags live here)\n'
+        kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{range .spec.template.spec.containers[*]}  == {.name}{"\n"}{range .args[*]}    {@}{"\n"}{end}{end}' 2>>"$ERRLOG"
+    } > "$d/spec-summary.txt"
+}
+
+write_workload_env() {
+    local kind="$1" name="$2" label="$3"
+    local d="$BUNDLE_DIR/workload/$label"
+    mkdir -p "$d"
+    local allow_flat
+    allow_flat=" $(printf '%s' "$WORKLOAD_ENV_ALLOWLIST" | tr '\n' ' ') "
+    {
+        echo "# Environment variables (values WIPED by default)."
+        echo "# A value is shown ONLY if its name is in the audited allow-list of"
+        echo "# non-sensitive serving/tuning parameters (WORKLOAD_ENV_ALLOWLIST in"
+        echo "# the script). valueFrom refs never expose the resolved value."
+        echo
+        kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{range .spec.template.spec.initContainers[*]}INIT|@|{.name}{"\n"}{range .env[*]}ENV|@|{.name}|@|{.value}|@|{.valueFrom}{"\n"}{end}{end}{range .spec.template.spec.containers[*]}MAIN|@|{.name}{"\n"}{range .env[*]}ENV|@|{.name}|@|{.value}|@|{.valueFrom}{"\n"}{end}{end}' 2>>"$ERRLOG" \
+        | awk -F'[|]@[|]' -v allow="$allow_flat" '
+            $1=="INIT" { printf "\n[init container: %s]\n", $2; next }
+            $1=="MAIN" { printf "\n[container: %s]\n", $2; next }
+            $1=="ENV"  {
+                n=$2; v=$3; vf=$4;
+                if (vf != "") { printf "  %s = <valueFrom (configMap/secret/field ref) — value NOT collected>\n", n; next }
+                if (index(allow, " " n " ") > 0) { printf "  %s = %s\n", n, v; next }
+                printf "  %s = <REDACTED>\n", n
+            }
+        '
+    } > "$d/env-redacted.txt"
+}
+
+collect_workload_refs() {
+    # ConfigMaps referenced by the workload -> dumped (config; regex-scrubbed in
+    # milestone 6). Secrets -> names, types, KEY NAMES only. Never secret values.
+    local kind="$1" name="$2" label="$3"
+    local d="$BUNDLE_DIR/workload/$label"
+    local refs="$WORK_DIR/refs-$label.txt"
+    mkdir -p "$d"
+
+    {
+        kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{range .spec.template.spec.volumes[*]}CM|@|{.configMap.name}{"\n"}SEC|@|{.secret.secretName}{"\n"}{end}' 2>>"$ERRLOG"
+        kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{range .spec.template.spec.containers[*]}{range .envFrom[*]}CM|@|{.configMapRef.name}{"\n"}SEC|@|{.secretRef.name}{"\n"}{end}{range .env[*]}CM|@|{.valueFrom.configMapKeyRef.name}{"\n"}SEC|@|{.valueFrom.secretKeyRef.name}{"\n"}{end}{end}' 2>>"$ERRLOG"
+        kc get "$kind" "$name" -n "$NAMESPACE" -o jsonpath='{range .spec.template.spec.initContainers[*]}{range .envFrom[*]}CM|@|{.configMapRef.name}{"\n"}SEC|@|{.secretRef.name}{"\n"}{end}{range .env[*]}CM|@|{.valueFrom.configMapKeyRef.name}{"\n"}SEC|@|{.valueFrom.secretKeyRef.name}{"\n"}{end}{end}' 2>>"$ERRLOG"
+    } > "$refs"
+
+    local cms secs cm s type keys
+    cms="$(awk -F'[|]@[|]' '$1=="CM"  && $2!="" {print $2}' "$refs" | sort -u)"
+    secs="$(awk -F'[|]@[|]' '$1=="SEC" && $2!="" {print $2}' "$refs" | sort -u)"
+
+    for cm in $cms; do
+        [ -n "$cm" ] || continue
+        capture "workload/$label/configmaps/$cm.yaml" kc get configmap "$cm" -n "$NAMESPACE" -o yaml
+    done
+
+    {
+        echo "# Secrets referenced by this workload."
+        echo "# Only secret NAMES, TYPES and KEY NAMES are recorded — never values."
+        echo
+        [ -z "$secs" ] && echo "(none referenced)"
+    } > "$d/secrets-referenced.txt"
+    for s in $secs; do
+        [ -n "$s" ] || continue
+        type="$(kc get secret "$s" -n "$NAMESPACE" -o jsonpath='{.type}' 2>>"$ERRLOG")"
+        # go-template over .data prints only the KEYS, never the values.
+        keys="$(kc get secret "$s" -n "$NAMESPACE" -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}' 2>>"$ERRLOG")"
+        {
+            printf '== %s (type=%s)\n' "$s" "${type:-unknown}"
+            if [ -n "$keys" ]; then
+                printf '%s\n' "$keys" | sed 's/^/   key: /'
+            else
+                echo '   (no data keys, or not readable with current RBAC)'
+            fi
+            echo
+        } >> "$d/secrets-referenced.txt"
+    done
+}
+
+sc_find() {
+    # sc_find "<title>" "<egrep-regex>" <file...>
+    local title="$1"; shift
+    local re="$1"; shift
+    local hits
+    hits="$(grep -iEh "$re" "$@" 2>/dev/null | grep -vE '^[[:space:]]*#' | sed 's/^[[:space:]]*//' | sort -u)"
+    if [ -n "$hits" ]; then
+        printf '%s:\n' "$title"
+        printf '%s\n' "$hits" | sed 's/^/    /'
+    else
+        printf '%s: <not explicitly set; engine defaults apply>\n' "$title"
+    fi
+    printf '\n'
+}
+
+write_serving_config() {
+    local label="$1"
+    local d="$BUNDLE_DIR/workload/$label"
+    local files="$d/spec-summary.txt $d/env-redacted.txt"
+    {
+        echo "# Serving-engine configuration — convenience extract."
+        echo "# Pulled from container args + allow-listed env. spec-summary.txt and"
+        echo "# env-redacted.txt remain the source of truth."
+        echo
+        sc_find "tensor / pipeline parallel" 'tensor[-_]parallel|pipeline[-_]parallel|(^|[^A-Z_])TP_SIZE|(^|[^A-Z_])PP_SIZE' $files
+        sc_find "max model length"           'max[-_]model[-_]len' $files
+        sc_find "gpu memory utilization"     'gpu[-_]memory[-_]utilization' $files
+        sc_find "quantization / dtype"       'quantization|kv[-_]cache[-_]dtype|(^|[^A-Za-z])dtype' $files
+        sc_find "batching / kv-cache"        'max[-_]num[-_]seqs|max[-_]num[-_]batched[-_]tokens|block[-_]size|swap[-_]space|chunked[-_]prefill' $files
+        sc_find "served model / recipe"      'served[-_]model|recipes?[-_]version|(^|[[:space:]]|=)--model([[:space:]]|=)' $files
+        sc_find "engine"                     'LLM_ENGINE|VLLM_EXTRA_ARGS|VLLM_LOGGING_LEVEL' $files
+    } > "$d/serving-config.txt"
+}
+
+collect_helm() {
+    local base="workload/helm"
+    mkdir -p "$BUNDLE_DIR/$base"
+
+    if ! $HAVE_HELM; then
+        printf 'helm not installed — release values/manifest skipped.\n' \
+            > "$BUNDLE_DIR/$base/SKIPPED.txt"
+        return 0
+    fi
+
+    capture "$base/releases.txt" helm list -n "$NAMESPACE"
+
+    local releases r
+    releases="$(helm list -n "$NAMESPACE" -q 2>>"$ERRLOG")"
+    if [ -z "$releases" ]; then
+        printf 'no helm releases found in namespace %s\n' "$NAMESPACE" \
+            > "$BUNDLE_DIR/$base/no-releases.txt"
+        return 0
+    fi
+
+    for r in $releases; do
+        [ -n "$r" ] || continue
+        # User-supplied values + rendered manifest. These commonly carry
+        # registry creds / HF tokens and are scrubbed by the regex safety net
+        # (milestone 6) before the bundle is archived.
+        capture "$base/$r.values.yaml"   helm get values   "$r" -n "$NAMESPACE"
+        capture "$base/$r.manifest.yaml" helm get manifest "$r" -n "$NAMESPACE"
+    done
+}
+
+# --- Milestones 4-5: stubs. ------------------------------------------------
+
 collect_state()    { record_collector state    not_implemented "milestone 4: events, pod status, OOMKill/CrashLoop detection"; }
 collect_logs()     { record_collector logs     not_implemented "milestone 4: bounded logs, current + previous containers"; }
 collect_metrics()  { record_collector metrics  not_implemented "milestone 5: kubectl top, serving /metrics (best-effort)"; }

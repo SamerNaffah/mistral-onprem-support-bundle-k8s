@@ -128,7 +128,7 @@ Design principle: **the primary control is NOT collecting secrets, not clever re
 
 - [x] Milestone 1 — skeleton: arg parsing, help, preflight (context echo + optional-tool detection), namespace auto-detect, temp dir, `--dry-run`, zip/tar.gz packaging, `manifest.json`
 - [x] Milestone 2 — `cluster/` + `gpu/` collectors (nvidia-smi via read-only exec, DCGM via pod proxy)
-- [ ] Milestone 3 — `workload/` + Helm + serving-config extraction *(official Helm chart to be provided)*
+- [x] Milestone 3 — `workload/` + Helm + serving-config extraction (tailored to the `mistral-inference-engine` chart)
 - [ ] Milestone 4 — `state/` + `logs/` + OOMKill/CrashLoop detection
 - [ ] Milestone 5 — `metrics/`
 - [ ] Milestone 6 — redaction engine + `test/` harness
