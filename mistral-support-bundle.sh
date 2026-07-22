@@ -874,10 +874,166 @@ collect_helm() {
     done
 }
 
-# --- Milestones 4-5: stubs. ------------------------------------------------
+# ===========================================================================
+# state/ — namespace events, pod/container status, and the red-flag detector
+# (OOMKilled / CrashLoopBackOff / high restart counts / image-pull errors).
+# All commands: kubectl get / describe. Read-only.
+# ===========================================================================
 
-collect_state()    { record_collector state    not_implemented "milestone 4: events, pod status, OOMKill/CrashLoop detection"; }
-collect_logs()     { record_collector logs     not_implemented "milestone 4: bounded logs, current + previous containers"; }
+STATE_RESTART_THRESHOLD=5   # restartCount at/above this is flagged
+STATE_NOTE=""
+
+collect_state() {
+    CAPTURE_FAILS=0
+    STATE_NOTE=""
+    mkdir -p "$BUNDLE_DIR/state"
+
+    # Namespace events, oldest-first (bounded by the cluster's event retention).
+    capture state/events.txt         kc get events -n "$NAMESPACE" -o wide --sort-by=.lastTimestamp
+    capture state/pods-wide.txt       kc get pods -n "$NAMESPACE" -o wide
+    capture state/workloads-wide.txt  kc get deployment,statefulset,daemonset,replicaset -n "$NAMESPACE" -o wide
+
+    # describe every pod in the namespace — probe failures, scheduling events,
+    # image-pull errors and lastState all surface here.
+    local p name
+    for p in $(kc get pods -n "$NAMESPACE" -o name 2>>"$ERRLOG"); do
+        name="${p##*/}"
+        [ -n "$name" ] || continue
+        capture "state/describe/${name}.txt" kc describe pod -n "$NAMESPACE" "$name"
+    done
+
+    write_state_status
+    write_state_anomalies
+
+    if [ "$CAPTURE_FAILS" -eq 0 ]; then
+        record_collector state ok "$STATE_NOTE"
+    else
+        record_collector state partial "$CAPTURE_FAILS capture(s) failed; $STATE_NOTE"
+    fi
+}
+
+# Per-pod/per-container status as one flat, delimited stream. Shared by the
+# human-readable table and the anomaly detector so they never disagree.
+state_status_stream() {
+    kc get pods -n "$NAMESPACE" -o jsonpath='{range .items[*]}POD|@|{.metadata.name}|@|{.status.phase}{"\n"}{range .status.initContainerStatuses[*]}C|@|init|@|{.name}|@|{.restartCount}|@|{.ready}|@|{.lastState.terminated.reason}|@|{.lastState.terminated.exitCode}|@|{.state.waiting.reason}{"\n"}{end}{range .status.containerStatuses[*]}C|@|main|@|{.name}|@|{.restartCount}|@|{.ready}|@|{.lastState.terminated.reason}|@|{.lastState.terminated.exitCode}|@|{.state.waiting.reason}{"\n"}{end}{end}' 2>>"$ERRLOG"
+}
+
+write_state_status() {
+    local out="$BUNDLE_DIR/state/pod-container-status.txt"
+    {
+        echo "# Pod / container status (restart counts, readiness, last termination)."
+        echo
+        state_status_stream | awk -F'[|]@[|]' '
+            $1=="POD" { printf "\n%s   (phase=%s)\n", $2, $3; next }
+            $1=="C"   {
+                printf "  [%-4s] %-32s restarts=%-4s ready=%-5s lastTerm=%-14s exit=%-4s waiting=%s\n", \
+                    $2, $3, $4, $5, ($6==""?"-":$6), ($7==""?"-":$7), ($8==""?"-":$8)
+            }
+        '
+    } > "$out"
+}
+
+write_state_anomalies() {
+    local out="$BUNDLE_DIR/state/anomalies.txt"
+    local body="$WORK_DIR/anomalies-body.txt"
+    local n
+
+    state_status_stream | awk -F'[|]@[|]' -v thr="$STATE_RESTART_THRESHOLD" '
+        $1=="POD" { pod=$2; next }
+        $1=="C"   {
+            kind=$2; c=$3; rc=$4+0; ready=$5; term=$6; ec=$7; wait=$8;
+            if (term=="OOMKilled")                                   printf "OOMKilled        pod=%s container=%s (%s) exitCode=%s\n", pod, c, kind, ec;
+            if (wait=="CrashLoopBackOff")                            printf "CrashLoopBackOff pod=%s container=%s (%s) restarts=%s\n", pod, c, kind, rc;
+            if (wait=="ImagePullBackOff" || wait=="ErrImagePull")    printf "ImagePullError   pod=%s container=%s (%s) reason=%s\n", pod, c, kind, wait;
+            if (rc>=thr)                                             printf "HighRestarts     pod=%s container=%s (%s) restartCount=%s\n", pod, c, kind, rc;
+        }
+    ' > "$body"
+
+    n="$(wc -l < "$body" 2>/dev/null | tr -d ' ')"; n="${n:-0}"
+    {
+        echo "# Detected red flags (OOMKilled / CrashLoopBackOff / image-pull / restarts>=$STATE_RESTART_THRESHOLD)."
+        echo "# Empty here is good. Full detail is in pod-container-status.txt and describe/."
+        echo
+        if [ "$n" -eq 0 ]; then
+            echo "No OOMKills, CrashLoops, image-pull errors, or high restart counts detected."
+        else
+            cat "$body"
+        fi
+    } > "$out"
+    STATE_NOTE="$n red flag(s)"
+}
+
+# ===========================================================================
+# logs/ — bounded container logs (current + previous) for every pod in the
+# target namespace. Bounded by --since and --tail; NEVER unbounded. Logs pass
+# through the redaction net (milestone 6) before archiving. kubectl logs is
+# read-only.
+# ===========================================================================
+
+collect_logs() {
+    CAPTURE_FAILS=0
+    mkdir -p "$BUNDLE_DIR/logs"
+    {
+        echo "# Bounded container logs."
+        echo "# window: --since=$SINCE    per-container cap: --tail=$TAIL_LINES lines"
+        echo "# <pod>/<container>.log          = current instance"
+        echo "# <pod>/<container>.previous.log = last terminated instance (only if it restarted)"
+        echo "# Logs are scrubbed by the redaction pass before archiving."
+    } > "$BUNDLE_DIR/logs/README.txt"
+
+    local pods p name pcount=0
+    pods="$(kc get pods -n "$NAMESPACE" -o name 2>>"$ERRLOG")"
+    if [ -z "$pods" ]; then
+        echo "no pods found in namespace $NAMESPACE" > "$BUNDLE_DIR/logs/no-pods.txt"
+        record_collector logs partial "no pods in $NAMESPACE"
+        return 0
+    fi
+
+    for p in $pods; do
+        name="${p##*/}"
+        [ -n "$name" ] || continue
+        collect_pod_logs "$name" && pcount=$((pcount + 1))
+    done
+
+    if [ "$CAPTURE_FAILS" -eq 0 ]; then
+        record_collector logs ok "$pcount pod(s); since=$SINCE tail=$TAIL_LINES"
+    else
+        record_collector logs partial "$CAPTURE_FAILS log capture(s) failed; $pcount pod(s)"
+    fi
+}
+
+collect_pod_logs() {
+    local pod="$1"
+    local d="$BUNDLE_DIR/logs/$pod"
+    local containers kind cname tmp
+    containers="$(kc get pod -n "$NAMESPACE" "$pod" \
+        -o jsonpath='{range .spec.initContainers[*]}init {.name}{"\n"}{end}{range .spec.containers[*]}main {.name}{"\n"}{end}' \
+        2>>"$ERRLOG")"
+    [ -n "$containers" ] || return 1
+    mkdir -p "$d"
+
+    # while-read over a heredoc (not a pipe) so CAPTURE_FAILS survives the loop.
+    while read -r kind cname; do
+        [ -n "$cname" ] || continue
+        capture "logs/$pod/${cname}.log" \
+            kc logs -n "$NAMESPACE" "$pod" -c "$cname" --since="$SINCE" --tail="$TAIL_LINES"
+        # Previous instance is absent unless the container restarted — that is
+        # expected, so it is best-effort and never counts as a capture failure.
+        tmp="$WORK_DIR/prevlog.tmp"
+        if kc logs -n "$NAMESPACE" "$pod" -c "$cname" --since="$SINCE" --tail="$TAIL_LINES" -p \
+                > "$tmp" 2>>"$ERRLOG" && [ -s "$tmp" ]; then
+            mv "$tmp" "$d/${cname}.previous.log"
+        else
+            rm -f "$tmp"
+        fi
+    done <<EOF
+$containers
+EOF
+    return 0
+}
+
+# --- Milestone 5: stub. ----------------------------------------------------
+
 collect_metrics()  { record_collector metrics  not_implemented "milestone 5: kubectl top, serving /metrics (best-effort)"; }
 
 run_collectors() {
