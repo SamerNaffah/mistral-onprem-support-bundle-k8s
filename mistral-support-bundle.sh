@@ -1032,9 +1032,142 @@ EOF
     return 0
 }
 
-# --- Milestone 5: stub. ----------------------------------------------------
+# ===========================================================================
+# metrics/ — resource usage (kubectl top, needs metrics-server) and the
+# serving engine's own Prometheus /metrics (vLLM/TGI-style), scraped read-only
+# through the API-server pod proxy (same mechanism as gpu/ DCGM — no exec, no
+# mutation). EVERYTHING here is BEST-EFFORT: metrics-server and an exposed
+# /metrics endpoint are both optional, so their absence is recorded, never
+# fatal. No inference content is ever touched — /metrics carries only counters
+# and gauges (request rates, latency histograms, KV-cache usage, ...).
+# ===========================================================================
 
-collect_metrics()  { record_collector metrics  not_implemented "milestone 5: kubectl top, serving /metrics (best-effort)"; }
+METRICS_MAX_BYTES=524288    # cap on a scraped /metrics payload (512 KiB)
+METRICS_NOTES=""
+
+metrics_note() { [ -n "$1" ] && METRICS_NOTES="${METRICS_NOTES:+$METRICS_NOTES; }$1"; }
+
+collect_metrics() {
+    CAPTURE_FAILS=0
+    METRICS_NOTES=""
+    mkdir -p "$BUNDLE_DIR/metrics"
+
+    collect_top
+    collect_serving_metrics
+
+    # top / serving-metrics unavailability is expected (optional components) and
+    # is recorded as a note, not a capture failure — the collector stays "ok".
+    if [ "$CAPTURE_FAILS" -eq 0 ]; then
+        record_collector metrics ok "$METRICS_NOTES"
+    else
+        record_collector metrics partial "$CAPTURE_FAILS capture(s) failed; $METRICS_NOTES"
+    fi
+}
+
+collect_top() {
+    local nodes="$BUNDLE_DIR/metrics/top-nodes.txt"
+    local pods="$BUNDLE_DIR/metrics/top-pods.txt"
+    local tmp="$WORK_DIR/top.tmp"
+
+    # kubectl top needs metrics-server; a missing/not-ready server is common,
+    # so treat failure as "unavailable" (a note) rather than a hard error.
+    if kc top nodes > "$tmp" 2>>"$ERRLOG" && [ -s "$tmp" ]; then
+        { printf '# kubectl top nodes\n'; cat "$tmp"; } > "$nodes"
+        metrics_note "top nodes ok"
+    else
+        echo "kubectl top nodes unavailable (metrics-server not installed or not ready)" > "$nodes"
+        metrics_note "top nodes unavailable"
+    fi
+
+    if kc top pods -n "$NAMESPACE" --containers > "$tmp" 2>>"$ERRLOG" && [ -s "$tmp" ]; then
+        { printf '# kubectl top pods -n %s --containers\n' "$NAMESPACE"; cat "$tmp"; } > "$pods"
+        metrics_note "top pods ok"
+    else
+        echo "kubectl top pods unavailable in $NAMESPACE (metrics-server not installed or not ready)" > "$pods"
+        metrics_note "top pods unavailable"
+    fi
+    rm -f "$tmp"
+}
+
+collect_serving_metrics() {
+    local out_dir="$BUNDLE_DIR/metrics/serving"
+    local cands="$WORK_DIR/serving-metrics-candidates.txt"
+    local ns pod scraped=0 tried=0 max_tries=3
+
+    # Candidate serving pods = running GPU pods in the target namespace (the
+    # inference engine). Same detection as gpu/ nvidia-smi.
+    kc get pods -n "$NAMESPACE" \
+        -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.containers[*].resources.limits.nvidia\.com/gpu}{"\n"}{end}' \
+        2>>"$ERRLOG" | awk '$3 != "" { print $1, $2 }' > "$cands"
+
+    if [ ! -s "$cands" ]; then
+        echo "no running GPU (serving) pod found in namespace $NAMESPACE — serving /metrics skipped" \
+            > "$BUNDLE_DIR/metrics/serving-metrics.txt"
+        metrics_note "no serving pod for /metrics"
+        return 0
+    fi
+
+    mkdir -p "$out_dir"
+    while read -r ns pod; do
+        [ -n "$pod" ] || continue
+        tried=$((tried + 1))
+        [ "$tried" -gt "$max_tries" ] && break
+        if scrape_serving_metrics "$ns" "$pod" "$out_dir/${pod}.metrics.txt"; then
+            scraped=$((scraped + 1))
+        fi
+    done < "$cands"
+
+    if [ "$scraped" -eq 0 ]; then
+        echo "GPU pod(s) found but no Prometheus /metrics endpoint responded ($tried tried). Not fatal — the serving engine may not expose /metrics, or it is on an unprobed port." \
+            > "$out_dir/UNAVAILABLE.txt"
+        metrics_note "serving /metrics unavailable ($tried tried)"
+    else
+        metrics_note "serving /metrics ok ($scraped pod(s))"
+    fi
+}
+
+scrape_serving_metrics() {
+    # Try a pod's Prometheus /metrics over the read-only API-server pod proxy.
+    # Returns 0 and writes $out on the first port that returns Prometheus text.
+    local ns="$1" pod="$2" out="$3"
+    local tmp="$WORK_DIR/serving-metrics.tmp"
+    local portspec ports port
+
+    portspec="$(kc get pod -n "$ns" "$pod" \
+        -o jsonpath='{range .spec.containers[*]}{range .ports[*]}{.name}{"="}{.containerPort}{"\n"}{end}{end}' \
+        2>>"$ERRLOG")"
+
+    # Candidate ports, best first: ports named *metric*, then http/api-ish
+    # ports, then the vLLM/TGI default 8000, then every remaining declared
+    # containerPort. De-duplicated, order preserved.
+    ports="$(
+        {
+            printf '%s\n' "$portspec" | awk -F= 'tolower($1) ~ /metric/ {print $2}'
+            printf '%s\n' "$portspec" | awk -F= 'tolower($1) ~ /http|api/  {print $2}'
+            echo 8000
+            printf '%s\n' "$portspec" | awk -F= '{print $2}'
+        } | awk 'NF && !seen[$0]++'
+    )"
+
+    for port in $ports; do
+        [ -n "$port" ] || continue
+        printf '### serving /metrics GET %s/%s:%s (read-only pod proxy)\n' "$ns" "$pod" "$port" >> "$ERRLOG"
+        # A real Prometheus endpoint emits "# HELP"/"# TYPE" lines; requiring
+        # them avoids saving HTML/JSON from an unrelated port.
+        if kc get --raw "/api/v1/namespaces/${ns}/pods/${pod}:${port}/proxy/metrics" > "$tmp" 2>>"$ERRLOG" \
+                && grep -qE '^# (HELP|TYPE) ' "$tmp"; then
+            {
+                printf '# serving Prometheus /metrics from %s/%s:%s (read-only GET via pod proxy)\n' "$ns" "$pod" "$port"
+                head -c "$METRICS_MAX_BYTES" "$tmp"
+                [ "$(wc -c < "$tmp")" -gt "$METRICS_MAX_BYTES" ] && printf '\n# [truncated at %s bytes]\n' "$METRICS_MAX_BYTES"
+            } > "$out"
+            rm -f "$tmp"
+            return 0
+        fi
+    done
+    rm -f "$tmp"
+    return 1
+}
 
 run_collectors() {
     local total name i=1

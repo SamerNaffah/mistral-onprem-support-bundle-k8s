@@ -130,6 +130,6 @@ Design principle: **the primary control is NOT collecting secrets, not clever re
 - [x] Milestone 2 — `cluster/` + `gpu/` collectors (nvidia-smi via read-only exec, DCGM via pod proxy)
 - [x] Milestone 3 — `workload/` + Helm + serving-config extraction (tailored to the `mistral-inference-engine` chart)
 - [x] Milestone 4 — `state/` + `logs/` + OOMKill/CrashLoop detection
-- [ ] Milestone 5 — `metrics/`
+- [x] Milestone 5 — `metrics/` (kubectl top nodes/pods; serving Prometheus /metrics via read-only pod proxy — all best-effort)
 - [ ] Milestone 6 — redaction engine + `test/` harness
 - [ ] Milestone 7 — `SUMMARY.txt`, `README-INSIDE.txt`, README, examples, LICENSE, polish
