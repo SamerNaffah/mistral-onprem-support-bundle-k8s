@@ -131,5 +131,5 @@ Design principle: **the primary control is NOT collecting secrets, not clever re
 - [x] Milestone 3 — `workload/` + Helm + serving-config extraction (tailored to the `mistral-inference-engine` chart)
 - [x] Milestone 4 — `state/` + `logs/` + OOMKill/CrashLoop detection
 - [x] Milestone 5 — `metrics/` (kubectl top nodes/pods; serving Prometheus /metrics via read-only pod proxy — all best-effort)
-- [ ] Milestone 6 — redaction engine + `test/` harness
+- [x] Milestone 6 — redaction engine (in-script regex safety net + `--redact-ips` + `--anonymize-names` for content, filenames, paths & manifest notes; per-file counts in `redaction-summary.txt` and `manifest.json`) + `test/` harness
 - [ ] Milestone 7 — `SUMMARY.txt`, `README-INSIDE.txt`, README, examples, LICENSE, polish

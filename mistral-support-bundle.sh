@@ -23,7 +23,7 @@
 #   - No prompt/completion/inference content is ever collected.
 #   - Secret VALUES are never collected (names and key names only, at most).
 #   - Env var values are wiped by default; a redaction pass runs over every
-#     file before archiving (see lib/redact-patterns.txt in later milestones).
+#     file before archiving (see build_redaction_sed for the exact rule list).
 #
 # AIR-GAP
 #
@@ -51,6 +51,7 @@ OUTPUT_PATH="$PWD"           # -o/--output; dir or explicit .zip/.tar.gz path
 SINCE="1h"                   # --since; log window
 TAIL_LINES=500               # --tail; max log lines per container
 ANONYMIZE_NAMES=false        # --anonymize-names
+REDACT_IPS=false             # --redact-ips (IPv4 addresses; off by default)
 REDACT=true                  # --no-redact flips this (discouraged)
 DRY_RUN=false                # --dry-run
 ASSUME_YES=false             # -y/--yes; skip interactive confirmation
@@ -145,6 +146,8 @@ Flags:
       --tail <n>          Max log lines per container (default: $TAIL_LINES).
       --anonymize-names   Consistently hash node/pod/namespace names.
                           Off by default (names usually help troubleshooting).
+      --redact-ips        Also redact IPv4 addresses. Off by default (IPs
+                          usually help troubleshooting).
       --no-redact         DISABLE the redaction pass. Discouraged; only for
                           debugging this tool itself. Prints a loud warning.
       --dry-run           Show what would be collected and exit. Does not
@@ -186,6 +189,8 @@ parse_args() {
                 TAIL_LINES="$2"; shift 2 ;;
             --anonymize-names)
                 ANONYMIZE_NAMES=true; shift ;;
+            --redact-ips)
+                REDACT_IPS=true; shift ;;
             --no-redact)
                 REDACT=false; shift ;;
             --dry-run)
@@ -1181,22 +1186,237 @@ run_collectors() {
     log ""
 }
 
-# ---------------------------------------------------------------------------
-# Redaction (milestone 6 — stub for now)
+# ===========================================================================
+# Redaction engine — ONE pass over every file in $BUNDLE_DIR before archiving.
 #
-# Final design: one pass over every file in $BUNDLE_DIR before archiving —
-# env-value wipe + Secret skip happen at collection time; the regex safety
-# net (lib/redact-patterns.txt) runs here. Counts land in manifest.json.
-# ---------------------------------------------------------------------------
+# Defense in depth (the regex net is the LAST line, not the first):
+#   1. Never collected      : prompt/completion content, Secret VALUES.
+#   2. Wiped at collection   : env var values (write_workload_env), unless the
+#                              name is in the audited WORKLOAD_ENV_ALLOWLIST.
+#   3. Regex safety net (HERE): scrub anything that still looks like a secret in
+#                              config/logs/helm-values — see build_redaction_sed
+#                              below, which is the single, human-readable list of
+#                              exactly what gets scrubbed.
+#   4. Optional (HERE)       : --anonymize-names (hash node/pod/ns names),
+#                              --redact-ips (IPv4 addresses).
+#
+# Every redaction inserts a "<REDACTED...>" marker; counting new markers per
+# file gives the redaction summary (redaction-summary.txt + manifest.json).
+# ===========================================================================
 
 REDACTION_COUNT=0
+ANONYMIZED_NAMES_COUNT=0
+NAME_MAP_FILE=""             # local-only reverse map (token -> real name); never archived
+
+# The single, auditable list of what the regex safety net scrubs. A security
+# reviewer can read every rule here. Written to $WORK_DIR/redact.sed and applied
+# with `sed -E`. Order matters (multi-line key blocks first).
+build_redaction_sed() {
+    local sedf="$WORK_DIR/redact.sed"
+    # Case-insensitive alternation of "sensitive-looking" key-name fragments.
+    cat > "$sedf" <<'SED'
+# --- Multi-line private key blocks -> single marker (PEM: RSA/EC/OPENSSH/...) ---
+/-----BEGIN[A-Z ]*PRIVATE KEY-----/,/-----END[A-Z ]*PRIVATE KEY-----/c\
+<REDACTED-PRIVATE-KEY-BLOCK>
+# --- Provider / API tokens (matched by shape, anywhere) ---
+s/hf_[A-Za-z0-9]{20,}/<REDACTED-HF-TOKEN>/g
+s/gh[pousr]_[A-Za-z0-9]{20,}/<REDACTED-GITHUB-TOKEN>/g
+s/xox[baprs]-[A-Za-z0-9-]{10,}/<REDACTED-SLACK-TOKEN>/g
+s/sk-[A-Za-z0-9]{20,}/<REDACTED-API-TOKEN>/g
+s/(AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[0-9A-Z]{16}/<REDACTED-AWS-KEY-ID>/g
+s/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/<REDACTED-JWT>/g
+s/([Bb]earer[[:space:]]+)[A-Za-z0-9._~+/-]{8,}=*/\1<REDACTED>/g
+# --- key = value / key: value where the KEY NAME looks sensitive ---
+# Keeps the key + separator (+ surrounding quotes); wipes only the value.
+s/([A-Za-z0-9_.-]*([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll][Ss]?|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Aa][Cc][Cc][Ee][Ss][Ss][_-]?[Kk][Ee][Yy]|[Kk][Ee][Yy])[[:space:]]*[=:][[:space:]]*)("?)[^"[:space:],}]*("?)/\1\3<REDACTED>\4/g
+# --- base64-encoded blobs WITH padding (certs, key material, encoded secrets) ---
+# Requires trailing "=" padding so image digests / hex / identifiers are kept.
+s/[A-Za-z0-9+/]{24,}={1,2}/<REDACTED-BASE64>/g
+# --- email addresses ---
+s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z][A-Za-z]+/<REDACTED-EMAIL>/g
+SED
+    if $REDACT_IPS; then
+        cat >> "$sedf" <<'SED'
+# --- IPv4 addresses (only with --redact-ips) ---
+s/([0-9]{1,3}\.){3}[0-9]{1,3}/<REDACTED-IP>/g
+SED
+    fi
+}
+
+# Consistent, one-way hash of a name -> short token. Deterministic across files
+# so "pod-a1b2c3d4" always refers to the same pod. Falls back through the hash
+# tools every platform is likely to have.
+hash_token() {
+    printf '%s' "$1" \
+        | { sha256sum 2>/dev/null || shasum -a 256 2>/dev/null || cksum; } \
+        | awk '{ print substr($1, 1, 8) }'
+}
+
+# Build a fixed-string sed map that replaces node/pod/namespace names with
+# stable hashed tokens. Longest names first so substrings never corrupt a
+# longer match (e.g. namespace "mistral" inside pod "mistral-0").
+build_name_map() {
+    local mapf="$WORK_DIR/name-map.sed"
+    # The reverse map lives in WORK_DIR, NOT the bundle: shipping token->realname
+    # inside the archive would defeat --anonymize-names. It is copied next to the
+    # finished archive (see place_name_map) for the operator to keep locally.
+    local human="$WORK_DIR/anonymized-names.txt"
+    NAME_MAP_FILE="$human"
+    : > "$mapf"
+    ANONYMIZED_NAMES_COUNT=0
+
+    {
+        [ -n "$NAMESPACE" ] && printf '%s ns\n' "$NAMESPACE"
+        local n
+        for n in $(get_nodes); do [ -n "$n" ] && printf '%s node\n' "$n"; done
+        kc get pods -n "$NAMESPACE" -o name 2>>"$ERRLOG" \
+            | sed 's|.*/||' | awk 'NF { print $0, "pod" }'
+    } \
+    | awk 'NF && !seen[$1]++ { print length($1), $0 }' \
+    | sort -rn \
+    | while read -r _len name kind; do
+        [ -n "$name" ] || continue
+        local tok esc
+        tok="${kind}-$(hash_token "$name")"
+        # Escape regex-significant chars that appear in DNS names ('.').
+        esc="$(printf '%s' "$name" | sed 's/[.[\*^$/]/\\&/g')"
+        printf 's/%s/%s/g\n' "$esc" "$tok" >> "$mapf"
+    done
+
+    {
+        echo "# --anonymize-names is ON. node/pod/namespace names in this bundle"
+        echo "# were replaced with stable hashed tokens (kind-<8 hex>)."
+        echo "#"
+        echo "# This file is the token -> real-name mapping. It is written NEXT TO"
+        echo "# the archive, NOT inside it, so the bundle you send stays anonymous."
+        echo "# Keep it PRIVATE. Use it to translate support's replies back to your"
+        echo "# real node/pod/namespace names."
+        echo
+        printf '%-16s   %s\n' "TOKEN" "REAL NAME"
+        awk -F'/' '{ printf "%-16s   %s\n", $3, $2 }' "$mapf" 2>/dev/null
+    } > "$human"
+
+    # A breadcrumb DOES go inside the bundle so support knows names were hashed.
+    {
+        echo "Node/pod/namespace names in this bundle were anonymized with"
+        echo "--anonymize-names. They appear as stable tokens like pod-a1b2c3d4."
+        echo "The token -> real-name mapping is NOT included here (that would"
+        echo "defeat anonymization); it was saved locally next to the archive"
+        echo "on the machine that generated this bundle."
+    } > "$BUNDLE_DIR/anonymized-names.README.txt"
+
+    ANONYMIZED_NAMES_COUNT="$(grep -c . "$mapf" 2>/dev/null | tr -d ' ')"
+    ANONYMIZED_NAMES_COUNT="${ANONYMIZED_NAMES_COUNT:-0}"
+}
+
+count_markers() { grep -o '<REDACTED' "$1" 2>/dev/null | wc -l | tr -d ' '; }
+
+# With --anonymize-names, real node/pod/namespace names also appear in FILE and
+# DIRECTORY names (e.g. cluster/nodes/describe-gpu-node-01.txt). Rewrite every
+# path component through the same fixed-string map so nothing leaks via paths.
+# -depth => children are renamed before their parents. Never renames the bundle
+# root, and never clobbers an existing target.
+anonymize_paths() {
+    local map="$WORK_DIR/name-map.sed"
+    [ -s "$map" ] || return 0
+    local p d b nb
+    find "$BUNDLE_DIR" -depth 2>/dev/null | while IFS= read -r p; do
+        [ "$p" = "$BUNDLE_DIR" ] && continue
+        d="$(dirname "$p")"; b="$(basename "$p")"
+        nb="$(printf '%s' "$b" | sed -f "$map")"
+        [ "$nb" = "$b" ] && continue
+        [ -e "$d/$nb" ] && continue
+        mv "$p" "$d/$nb" 2>/dev/null || true
+    done
+}
+
+# Redact one file in place. Echoes the number of NEW <REDACTED...> markers.
+redact_file() {
+    local f="$1"
+    local tmp="$WORK_DIR/redact.tmp"
+    local before after added
+
+    # Skip binary and empty files (-I => binary counts as no match).
+    LC_ALL=C grep -qI . "$f" 2>/dev/null || { echo 0; return 0; }
+
+    before="$(count_markers "$f")"
+
+    # Name anonymization first (plain sed, fixed strings), then the regex net.
+    if $ANONYMIZE_NAMES && [ -s "$WORK_DIR/name-map.sed" ]; then
+        sed -f "$WORK_DIR/name-map.sed" "$f" > "$tmp" && mv "$tmp" "$f"
+    fi
+    sed -E -f "$WORK_DIR/redact.sed" "$f" > "$tmp" && mv "$tmp" "$f"
+
+    after="$(count_markers "$f")"
+    added=$((after - before))
+    [ "$added" -lt 0 ] && added=0
+    echo "$added"
+}
 
 redact_bundle() {
+    REDACTION_COUNT=0
     if ! $REDACT; then
-        warn "redaction pass SKIPPED (--no-redact)."
+        warn "redaction pass SKIPPED (--no-redact) — this bundle may contain secrets."
         return 0
     fi
-    log "Redaction pass: engine not yet implemented (milestone 6) — 0 files scanned."
+
+    log "Redaction pass: scanning bundle files..."
+    build_redaction_sed
+    $ANONYMIZE_NAMES && build_name_map
+
+    local body="$WORK_DIR/redaction-body.txt"
+    : > "$body"
+
+    # Snapshot the file list BEFORE writing the summary (so it isn't self-scanned).
+    local files f rel c scanned=0
+    files="$(find "$BUNDLE_DIR" -type f 2>/dev/null)"
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        scanned=$((scanned + 1))
+        c="$(redact_file "$f")"
+        if [ "${c:-0}" -gt 0 ]; then
+            rel="${f#"$BUNDLE_DIR"/}"
+            printf '%6d  %s\n' "$c" "$rel" >> "$body"
+            REDACTION_COUNT=$((REDACTION_COUNT + c))
+        fi
+    done <<EOF
+$files
+EOF
+
+    # Anonymize path components too, and rewrite the summary's own path column
+    # through the same map so real names don't survive in redaction-summary.txt.
+    if $ANONYMIZE_NAMES && [ -s "$WORK_DIR/name-map.sed" ]; then
+        anonymize_paths
+        if [ -s "$body" ]; then
+            sed -f "$WORK_DIR/name-map.sed" "$body" > "$body.anon" \
+                && mv "$body.anon" "$body"
+        fi
+    fi
+
+    {
+        echo "# Redaction summary (regex safety net + optional name/IP redaction)."
+        echo "# Counts are new <REDACTED...> markers inserted per file."
+        echo "# Also enforced earlier: env values wiped at collection, Secret"
+        echo "# values never collected, no inference content ever touched."
+        echo
+        printf 'total values redacted : %s\n' "$REDACTION_COUNT"
+        printf 'files scanned         : %s\n' "$scanned"
+        printf 'anonymize-names       : %s' "$ANONYMIZE_NAMES"
+        $ANONYMIZE_NAMES && printf ' (%s name(s) mapped)' "$ANONYMIZED_NAMES_COUNT"
+        printf '\n'
+        printf 'redact-ips            : %s\n' "$REDACT_IPS"
+        echo
+        if [ "$REDACTION_COUNT" -gt 0 ]; then
+            echo "per-file (count  path):"
+            sort -rn "$body"
+        else
+            echo "No regex-matched secrets found in collected files (good — the"
+            echo "collection-time controls above already keep secrets out)."
+        fi
+    } > "$BUNDLE_DIR/redaction-summary.txt"
+
+    log "Redaction pass: $REDACTION_COUNT value(s) redacted across $scanned file(s)."
+    $ANONYMIZE_NAMES && log "  anonymized $ANONYMIZED_NAMES_COUNT name(s) (mapping kept local, next to the archive)."
 }
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1442,7 @@ write_manifest() {
         printf '    "since": "%s",\n'                 "$(json_escape "$SINCE")"
         printf '    "tail": %s,\n'                    "$TAIL_LINES"
         printf '    "anonymize_names": %s,\n'         "$ANONYMIZE_NAMES"
+        printf '    "redact_ips": %s,\n'              "$REDACT_IPS"
         printf '    "redact": %s\n'                   "$REDACT"
         printf '  },\n'
         printf '  "optional_tools": {\n'
@@ -1244,6 +1465,14 @@ write_manifest() {
         printf '  }\n'
         printf '}\n'
     } > "$manifest"
+
+    # manifest.json is written AFTER the redaction pass (so its own flags aren't
+    # scrubbed), but collector "note" fields can embed real pod/node names. When
+    # anonymizing, run just the fixed-string name map over it — no secret regex.
+    if $ANONYMIZE_NAMES && [ -s "$WORK_DIR/name-map.sed" ]; then
+        sed -f "$WORK_DIR/name-map.sed" "$manifest" > "$manifest.anon" \
+            && mv "$manifest.anon" "$manifest"
+    fi
 
     if $HAVE_JQ; then
         jq . "$manifest" >/dev/null 2>&1 || warn "manifest.json failed jq validation (tool bug — please report)"
@@ -1270,6 +1499,17 @@ resolve_archive_path() {
                 ARCHIVE_PATH="$OUTPUT_PATH/$BUNDLE_NAME.tar.gz"
             fi ;;
     esac
+}
+
+# Copy the local-only anonymized-names map next to the finished archive, so the
+# operator keeps the token -> real-name key without it ever entering the bundle.
+place_name_map() {
+    $ANONYMIZE_NAMES || return 0
+    [ -s "$NAME_MAP_FILE" ] || return 0
+    local dest="${ARCHIVE_PATH%.zip}"; dest="${dest%.tar.gz}-anonymized-names.txt"
+    if cp "$NAME_MAP_FILE" "$dest" 2>/dev/null; then
+        NAME_MAP_FILE="$dest"
+    fi
 }
 
 archive_bundle() {
@@ -1299,8 +1539,9 @@ DRY RUN — nothing will be collected, the cluster will not be contacted.
   namespace  : ${NAMESPACE:-<auto-detect GPU namespaces at runtime>}
   output     : $OUTPUT_PATH
   log window : --since $SINCE, --tail $TAIL_LINES
-  redaction  : $($REDACT && echo ON || echo "OFF (--no-redact)")
-  anonymize  : $ANONYMIZE_NAMES
+  redaction  : $($REDACT && echo "ON (regex safety net + env-value wipe)" || echo "OFF (--no-redact)")
+  anonymize  : $ANONYMIZE_NAMES (node/pod/namespace names)
+  redact-ips : $REDACT_IPS
 
 Planned bundle tree (all commands read-only):
 
@@ -1344,11 +1585,18 @@ main() {
     redact_bundle
     write_manifest
     archive_bundle
+    place_name_map
 
     log ""
     log "Bundle written: $ARCHIVE_PATH"
-    log "Redactions: $REDACTION_COUNT (engine lands in milestone 6)"
+    log "Redactions: $REDACTION_COUNT value(s) scrubbed (see redaction-summary.txt)"
+    $ANONYMIZE_NAMES && log "Name map (KEEP PRIVATE): $NAME_MAP_FILE"
     log "The archive is plain text — inspect it before sending to support."
 }
 
-main "$@"
+# Source guard: allow the test harness to source this file for its functions
+# (globals + collectors + redaction) WITHOUT running a collection. Set
+# MSB_LIB_ONLY=1, or source it (BASH_SOURCE != $0), to load-only.
+if [ "${MSB_LIB_ONLY:-0}" != "1" ] && [ "${BASH_SOURCE:-$0}" = "$0" ]; then
+    main "$@"
+fi
