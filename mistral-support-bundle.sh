@@ -1480,6 +1480,164 @@ write_manifest() {
 }
 
 # ---------------------------------------------------------------------------
+# README-INSIDE.txt — privacy statement shipped inside the bundle
+# ---------------------------------------------------------------------------
+# Static, human-readable note so anyone opening the archive knows what is (and
+# is not) in it and how to inspect it before sending. No cluster data here.
+
+write_readme_inside() {
+    {
+        echo "$TOOL_NAME v$TOOL_VERSION — what is in this bundle"
+        echo "===================================================="
+        echo
+        echo "This archive was produced by $TOOL_NAME, a READ-ONLY diagnostic"
+        echo "collector for Mistral LLM deployments on Kubernetes. It is meant to be"
+        echo "attached to a support ticket. Everything in it is plain text or JSON —"
+        echo "open it and inspect it before you send it."
+        echo
+        echo "WHAT WAS COLLECTED"
+        echo "  cluster/   kubectl + Kubernetes versions, nodes, storage classes,"
+        echo "             distro / CNI hints"
+        echo "  gpu/       GPU node labels, device-plugin / GPU Operator status,"
+        echo "             nvidia-smi (best-effort read-only exec), DCGM metrics"
+        echo "  workload/  serving Deployment/StatefulSet spec, images, resources,"
+        echo "             serving-engine args, referenced ConfigMaps, Helm values"
+        echo "  state/     namespace events, pod/container status, OOMKill/CrashLoop"
+        echo "  logs/      bounded recent logs (current + previous containers)"
+        echo "  metrics/   kubectl top nodes/pods, serving /metrics (best-effort)"
+        echo "  manifest.json, SUMMARY.txt, redaction-summary.txt"
+        echo
+        echo "WHAT WAS **NOT** COLLECTED, EVER"
+        echo "  - No prompt / completion / request / response content. This tool"
+        echo "    never touches inference payloads."
+        echo "  - No Secret values. At most, Secret names and key names are recorded."
+        echo "  - No environment-variable values, except a short, audited allow-list"
+        echo "    of non-sensitive serving parameters (e.g. TENSOR_PARALLEL_SIZE,"
+        echo "    MAX_MODEL_LEN)."
+        echo
+        echo "REDACTION"
+        echo "  A single redaction pass ran over every file before archiving: env"
+        echo "  values are wiped, and a regex safety net scrubs tokens, keys, JWTs,"
+        echo "  private-key blocks, padded base64 blobs and email addresses."
+        echo "  Values redacted: $REDACTION_COUNT (per-file counts in redaction-summary.txt)."
+        if $ANONYMIZE_NAMES; then
+            echo "  Node/pod/namespace names were anonymized (--anonymize-names). The"
+            echo "  reverse map is kept OUTSIDE this archive, next to it on the machine"
+            echo "  that ran the tool."
+        else
+            echo "  Node/pod/namespace names were NOT anonymized (the default). Re-run"
+            echo "  with --anonymize-names if you need them hashed."
+        fi
+        $REDACT || {
+            echo
+            echo "  WARNING: redaction was DISABLED for this run (--no-redact)."
+            echo "  Treat this bundle as sensitive."
+        }
+        echo
+        echo "HOW TO INSPECT BEFORE SENDING"
+        echo "  unzip -l <archive>.zip     # or: tar tzf <archive>.tar.gz"
+        echo "  less SUMMARY.txt           # at-a-glance findings"
+        echo "  less redaction-summary.txt # what was scrubbed, per file"
+        echo
+        echo "No network calls, no upload, and no telemetry were made by this tool."
+    } > "$BUNDLE_DIR/README-INSIDE.txt"
+}
+
+# ---------------------------------------------------------------------------
+# SUMMARY.txt — the at-a-glance page a support engineer reads first
+# ---------------------------------------------------------------------------
+# Derived from files already in the (redacted) bundle plus safe globals. Runs
+# AFTER the redaction pass, so it inherits redacted/anonymized content; under
+# --anonymize-names any names it prints are run through the same name map last.
+
+write_summary() {
+    local out="$BUNDLE_DIR/SUMMARY.txt"
+    local node_count=0 gpu_count=0 distro="unknown" wl_spec hits
+
+    if [ -f "$BUNDLE_DIR/cluster/nodes-wide.txt" ]; then
+        node_count="$(grep -cvE '^NAME|^[[:space:]]*$' "$BUNDLE_DIR/cluster/nodes-wide.txt" 2>/dev/null)"
+        node_count="${node_count:-0}"
+    fi
+
+    if [ -f "$BUNDLE_DIR/gpu/gpu-nodes.txt" ]; then
+        gpu_count="$(grep -cE '^nvidia\.com/gpu capacity[[:space:]]*:[[:space:]]*[0-9]' "$BUNDLE_DIR/gpu/gpu-nodes.txt" 2>/dev/null)"
+        gpu_count="${gpu_count:-0}"
+    fi
+
+    if [ -f "$BUNDLE_DIR/cluster/distro-hint.txt" ]; then
+        distro="$(grep -vE '^#|^[[:space:]]*$' "$BUNDLE_DIR/cluster/distro-hint.txt" 2>/dev/null | head -1)"
+        distro="${distro:-unknown}"
+    fi
+
+    wl_spec="$(ls "$BUNDLE_DIR"/workload/*/spec-summary.txt 2>/dev/null | head -1)"
+
+    {
+        echo "$TOOL_NAME v$TOOL_VERSION — support bundle summary"
+        echo "===================================================="
+        echo
+        echo "Generated : $TIMESTAMP_UTC"
+        echo "Context   : $KUBE_CONTEXT"
+        echo "Namespace : ${NAMESPACE:-<none>}"
+        echo
+        echo "-- Cluster -----------------------------------------------------------"
+        echo "  kubectl (client) : ${KUBECTL_CLIENT_VERSION:-unknown}"
+        echo "  kubernetes (srv) : ${KUBE_SERVER_VERSION:-unknown}"
+        echo "  distro hint      : $distro"
+        echo "  nodes            : $node_count"
+        echo "  GPU nodes        : $gpu_count (advertising nvidia.com/gpu)"
+        echo
+        echo "-- Workload / serving config -----------------------------------------"
+        if [ -n "$wl_spec" ] && [ -f "$wl_spec" ]; then
+            grep -E '^(kind|name|helm chart|replicas)' "$wl_spec" 2>/dev/null | sed 's/^/  /'
+            echo "  images:"
+            awk '/^\[images\]/{f=1;next} /^\[/{f=0} f && NF && $0 !~ /init\//{print "   "$0}' "$wl_spec" 2>/dev/null | head -4
+            echo "  serving flags (detected):"
+            hits="$(grep -iE 'tensor.parallel|max.model.len|quantization|dtype|gpu.memory.util|kv.cache|max.num.(seqs|batched)' "$wl_spec" 2>/dev/null | sed 's/^[[:space:]]*/   /' | head -12)"
+            if [ -n "$hits" ]; then printf '%s\n' "$hits"; else echo "   (none matched — see workload/*/spec-summary.txt)"; fi
+        else
+            echo "  no GPU workload spec captured (see workload/)."
+        fi
+        echo
+        echo "-- Red flags ---------------------------------------------------------"
+        if [ -f "$BUNDLE_DIR/state/anomalies.txt" ]; then
+            if grep -q 'No OOMKills' "$BUNDLE_DIR/state/anomalies.txt" 2>/dev/null; then
+                echo "  none detected (no OOMKills, CrashLoops, image-pull errors, high restarts)"
+            else
+                grep -vE '^#|^[[:space:]]*$' "$BUNDLE_DIR/state/anomalies.txt" 2>/dev/null | sed 's/^/  /' | head -20
+            fi
+        else
+            echo "  state/ not collected."
+        fi
+        echo
+        echo "-- Collectors --------------------------------------------------------"
+        if [ -f "$COLLECTOR_STATUS_FILE" ]; then
+            awk -F'|' '{ printf "  %-9s %s%s\n", $1, $2, ($3==""?"":"  ("$3")") }' "$COLLECTOR_STATUS_FILE"
+        else
+            echo "  (collector status unavailable)"
+        fi
+        echo
+        echo "-- Privacy -----------------------------------------------------------"
+        echo "  redaction      : $($REDACT && echo ON || echo 'OFF (--no-redact)')"
+        echo "  values scrubbed: $REDACTION_COUNT (see redaction-summary.txt)"
+        if $ANONYMIZE_NAMES; then
+            echo "  anonymize-names: true ($ANONYMIZED_NAMES_COUNT name(s); map kept OUTSIDE the archive)"
+        else
+            echo "  anonymize-names: false"
+        fi
+        echo "  redact-ips     : $REDACT_IPS"
+        echo
+        echo "At-a-glance only. Full detail is in the directories above; manifest.json"
+        echo "has the machine-readable record. Inspect this archive before sending."
+    } > "$out"
+
+    # Consistency with the rest of the bundle: if names were anonymized, run the
+    # same fixed-string map over the summary so no real name survives here.
+    if $ANONYMIZE_NAMES && [ -s "$WORK_DIR/name-map.sed" ]; then
+        sed -f "$WORK_DIR/name-map.sed" "$out" > "$out.anon" && mv "$out.anon" "$out"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Archive
 # ---------------------------------------------------------------------------
 
@@ -1584,6 +1742,8 @@ main() {
     run_collectors
     redact_bundle
     write_manifest
+    write_readme_inside
+    write_summary
     archive_bundle
     place_name_map
 

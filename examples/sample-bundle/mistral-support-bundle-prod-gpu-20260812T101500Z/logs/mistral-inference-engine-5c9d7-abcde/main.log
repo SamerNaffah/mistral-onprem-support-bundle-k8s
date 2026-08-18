@@ -1,0 +1,6 @@
+INFO 08-12 10:09:41 api_server.py:521] vLLM API server version 0.6.3
+INFO 08-12 10:09:42 model_runner.py:112] Loading model mistral-small ...
+INFO 08-12 10:10:15 model_runner.py:180] Model loaded in 33.1s
+INFO 08-12 10:10:15 gpu_executor.py:64] # GPU blocks: 24576, # CPU blocks: 2048
+INFO 08-12 10:10:16 api_server.py:210] Started server process
+INFO 08-12 10:10:16 launcher.py:28] Uvicorn running on http://0.0.0.0:8000

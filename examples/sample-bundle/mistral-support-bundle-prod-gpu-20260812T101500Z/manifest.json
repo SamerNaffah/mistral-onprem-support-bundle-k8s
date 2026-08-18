@@ -1,0 +1,33 @@
+{
+  "tool": "mistral-support-bundle",
+  "tool_version": "0.1.0",
+  "generated_at_utc": "2026-08-12T10:15:00Z",
+  "kubectl_client_version": "v1.29.4",
+  "kubernetes_server_version": "v1.29.4",
+  "context": "prod-gpu",
+  "namespace": "mistral",
+  "flags": {
+    "since": "1h",
+    "tail": 500,
+    "anonymize_names": true,
+    "redact_ips": false,
+    "redact": true
+  },
+  "optional_tools": {
+    "helm": true,
+    "jq": true,
+    "zip": true
+  },
+  "collectors": [
+    { "name": "cluster", "status": "ok", "note": "" },
+    { "name": "gpu", "status": "ok", "note": "" },
+    { "name": "workload", "status": "ok", "note": "" },
+    { "name": "state", "status": "ok", "note": "" },
+    { "name": "logs", "status": "ok", "note": "" },
+    { "name": "metrics", "status": "partial", "note": "kubectl top pods unavailable (metrics-server not installed)" }
+  ],
+  "redaction": {
+    "applied": true,
+    "total_redactions": 17
+  }
+}

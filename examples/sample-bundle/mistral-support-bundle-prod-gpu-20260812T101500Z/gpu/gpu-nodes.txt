@@ -1,0 +1,21 @@
+== node: node-e5f6a7b8
+nvidia.com/gpu capacity   : 8
+nvidia.com/gpu allocatable: 8
+GPU-related labels:
+  nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3
+  nvidia.com/cuda.driver.major=550
+  nvidia.com/gpu.count=8
+
+== node: node-c9d0e1f2
+nvidia.com/gpu capacity   : 8
+nvidia.com/gpu allocatable: 8
+GPU-related labels:
+  nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3
+  nvidia.com/cuda.driver.major=550
+  nvidia.com/gpu.count=8
+
+== node: node-a1b2c3d4
+nvidia.com/gpu capacity   : <none>
+nvidia.com/gpu allocatable: <none>
+GPU-related labels:
+  <none>

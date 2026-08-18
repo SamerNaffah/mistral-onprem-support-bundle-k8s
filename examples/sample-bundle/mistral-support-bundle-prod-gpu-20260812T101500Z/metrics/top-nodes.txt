@@ -1,0 +1,4 @@
+NAME            CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%
+node-a1b2c3d4   842m         5%     6144Mi          9%
+node-e5f6a7b8   9210m        57%    72310Mi         56%
+node-c9d0e1f2   8975m        56%    70112Mi         54%
