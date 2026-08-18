@@ -1,0 +1,3 @@
+NAME                 PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+local-path (default) rancher.io/local-path   Delete          WaitForFirstConsumer   false                  88d
+fast-nvme            csi.example.com         Delete          WaitForFirstConsumer   true                   88d

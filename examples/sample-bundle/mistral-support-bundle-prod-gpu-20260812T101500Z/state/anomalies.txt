@@ -1,0 +1,2 @@
+# Red-flag scan of namespace state (OOMKills, CrashLoops, image-pull, restarts)
+No OOMKills, CrashLoopBackOffs, image-pull errors or high restart counts found.

@@ -1,0 +1,4 @@
+NAME            STATUS   ROLES           AGE   VERSION   INTERNAL-IP   EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION      CONTAINER-RUNTIME
+node-a1b2c3d4   Ready    control-plane   88d   v1.29.4   <ip>          <none>        Ubuntu 22.04.4 LTS   5.15.0-105-generic  containerd://1.7.13
+node-e5f6a7b8   Ready    <none>          88d   v1.29.4   <ip>          <none>        Ubuntu 22.04.4 LTS   5.15.0-105-generic  containerd://1.7.13
+node-c9d0e1f2   Ready    <none>          88d   v1.29.4   <ip>          <none>        Ubuntu 22.04.4 LTS   5.15.0-105-generic  containerd://1.7.13

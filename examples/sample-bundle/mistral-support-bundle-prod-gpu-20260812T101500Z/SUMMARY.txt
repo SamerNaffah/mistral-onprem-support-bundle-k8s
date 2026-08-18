@@ -1,0 +1,50 @@
+mistral-support-bundle v0.1.0 — support bundle summary
+====================================================
+
+Generated : 2026-08-12T10:15:00Z
+Context   : prod-gpu
+Namespace : mistral
+
+-- Cluster -----------------------------------------------------------
+  kubectl (client) : v1.29.4
+  kubernetes (srv) : v1.29.4
+  distro hint      : Vanilla Kubernetes (kubeadm); CNI: Calico
+  nodes            : 3
+  GPU nodes        : 2 (advertising nvidia.com/gpu)
+
+-- Workload / serving config -----------------------------------------
+  kind      : Deployment
+  name      : mistral-inference-engine
+  helm chart: mistral-inference-engine-0.4.2
+  replicas  : 2
+  images:
+     main: registry.example/mistral/vllm-mistral-small:0.6.3
+  serving flags (detected):
+   --tensor-parallel-size=4
+   --max-model-len=32768
+   --gpu-memory-utilization=0.92
+   --dtype=bfloat16
+   --kv-cache-dtype=auto
+   --max-num-seqs=256
+   TENSOR_PARALLEL_SIZE=4
+   MAX_MODEL_LEN=32768
+
+-- Red flags ---------------------------------------------------------
+  none detected (no OOMKills, CrashLoops, image-pull errors, high restarts)
+
+-- Collectors --------------------------------------------------------
+  cluster   ok
+  gpu       ok
+  workload  ok
+  state     ok
+  logs      ok
+  metrics   partial  (kubectl top pods unavailable (metrics-server not installed))
+
+-- Privacy -----------------------------------------------------------
+  redaction      : ON
+  values scrubbed: 17 (see redaction-summary.txt)
+  anonymize-names: true (3 name(s); map kept OUTSIDE the archive)
+  redact-ips     : false
+
+At-a-glance only. Full detail is in the directories above; manifest.json
+has the machine-readable record. Inspect this archive before sending.

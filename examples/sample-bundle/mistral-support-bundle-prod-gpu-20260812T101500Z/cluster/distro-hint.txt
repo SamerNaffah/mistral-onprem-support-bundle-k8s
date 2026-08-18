@@ -1,0 +1,2 @@
+# distro / CNI hint (best-effort, from version + node labels)
+Vanilla Kubernetes (kubeadm); CNI: Calico

@@ -1,0 +1,23 @@
+kind      : Deployment
+name      : mistral-inference-engine
+helm chart: mistral-inference-engine-0.4.2
+replicas  : 2
+
+[images]
+  main: registry.example/mistral/vllm-mistral-small:0.6.3
+  init/model-downloader: registry.example/tools/model-dl:1.2.0
+
+[resources]
+  main: requests cpu=8 memory=64Gi nvidia.com/gpu=4 | limits nvidia.com/gpu=4
+
+[container args]
+  --tensor-parallel-size=4
+  --max-model-len=32768
+  --gpu-memory-utilization=0.92
+  --dtype=bfloat16
+  --kv-cache-dtype=auto
+  --max-num-seqs=256
+
+[env allow-list]
+  TENSOR_PARALLEL_SIZE=4
+  MAX_MODEL_LEN=32768

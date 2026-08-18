@@ -1,0 +1,6 @@
+# Redaction summary (per file). Total values scrubbed: 17
+cluster/nodes-wide.txt          : 3
+state/pods-wide.txt             : 2
+workload/mistral-inference-engine/spec-summary.txt : 0
+gpu/nvidia-smi.txt              : 0
+(remaining counts across other files) : 12
