@@ -1,0 +1,4 @@
+# kubectl top pods -n mistral --containers
+POD                                    NAME   CPU(cores)   MEMORY(bytes)
+mistral-inference-engine-5c9d7-abcde   main   6420m        68210Mi
+mistral-inference-engine-7f2a1-fghij   main   6180m        67540Mi

@@ -71,6 +71,7 @@ COLLECTOR_STATUS_FILE=""     # one line per collector: name|status|note
 ARCHIVE_PATH=""              # final archive location
 
 TIMESTAMP_UTC="$(date -u +%Y%m%dT%H%M%SZ)"
+TIMESTAMP_HUMAN="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"  # readable form of the same run instant
 
 # Collector registry. Milestone 1: all stubs. Order matters for output.
 COLLECTORS="cluster gpu workload state logs metrics"
@@ -1575,7 +1576,7 @@ write_summary() {
         echo "$TOOL_NAME v$TOOL_VERSION — support bundle summary"
         echo "===================================================="
         echo
-        echo "Generated : $TIMESTAMP_UTC"
+        echo "Generated : $TIMESTAMP_HUMAN  ($TIMESTAMP_UTC)"
         echo "Context   : $KUBE_CONTEXT"
         echo "Namespace : ${NAMESPACE:-<none>}"
         echo
@@ -1596,6 +1597,31 @@ write_summary() {
             if [ -n "$hits" ]; then printf '%s\n' "$hits"; else echo "   (none matched — see workload/*/spec-summary.txt)"; fi
         else
             echo "  no GPU workload spec captured (see workload/)."
+        fi
+        echo
+        echo "-- Metrics -----------------------------------------------------------"
+        if [ -f "$BUNDLE_DIR/metrics/top-nodes.txt" ] && grep -q '^# kubectl top nodes' "$BUNDLE_DIR/metrics/top-nodes.txt" 2>/dev/null; then
+            echo "  top nodes (CPU/mem):"
+            grep -vE '^#|^[[:space:]]*$' "$BUNDLE_DIR/metrics/top-nodes.txt" 2>/dev/null | sed 's/^/    /' | head -6
+        else
+            echo "  top nodes       : unavailable (metrics-server not installed or not ready)"
+        fi
+        if [ -f "$BUNDLE_DIR/metrics/top-pods.txt" ] && grep -q '^# kubectl top pods' "$BUNDLE_DIR/metrics/top-pods.txt" 2>/dev/null; then
+            echo "  top pods (first rows):"
+            grep -vE '^#|^[[:space:]]*$' "$BUNDLE_DIR/metrics/top-pods.txt" 2>/dev/null | sed 's/^/    /' | head -6
+        else
+            echo "  top pods        : unavailable in ${NAMESPACE:-<none>} (metrics-server not installed or not ready)"
+        fi
+        if ls "$BUNDLE_DIR"/metrics/serving/*.metrics.txt >/dev/null 2>&1; then
+            local sm_count
+            sm_count="$(ls "$BUNDLE_DIR"/metrics/serving/*.metrics.txt 2>/dev/null | wc -l | tr -d ' ')"
+            echo "  serving /metrics: captured for $sm_count pod(s) (see metrics/serving/)"
+        elif [ -f "$BUNDLE_DIR/metrics/serving/UNAVAILABLE.txt" ]; then
+            echo "  serving /metrics: unavailable (no Prometheus endpoint responded)"
+        elif [ -f "$BUNDLE_DIR/metrics/serving-metrics.txt" ]; then
+            echo "  serving /metrics: skipped (no running GPU/serving pod)"
+        else
+            echo "  serving /metrics: not collected"
         fi
         echo
         echo "-- Red flags ---------------------------------------------------------"

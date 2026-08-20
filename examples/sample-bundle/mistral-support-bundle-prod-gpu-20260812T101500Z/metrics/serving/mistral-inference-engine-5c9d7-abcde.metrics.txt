@@ -1,0 +1,10 @@
+# serving Prometheus /metrics from mistral/mistral-inference-engine-5c9d7-abcde:8000 (read-only GET via pod proxy)
+# HELP vllm:num_requests_running Number of requests currently running on GPU.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running 12.0
+# HELP vllm:num_requests_waiting Number of requests waiting to be processed.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting 3.0
+# HELP vllm:gpu_cache_usage_perc GPU KV-cache usage. 1 = 100%.
+# TYPE vllm:gpu_cache_usage_perc gauge
+vllm:gpu_cache_usage_perc 0.74
