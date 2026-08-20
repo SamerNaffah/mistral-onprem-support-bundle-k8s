@@ -1,7 +1,7 @@
 mistral-support-bundle v0.1.0 — support bundle summary
 ====================================================
 
-Generated : 2026-08-12T10:15:00Z
+Generated : 2026-08-12 10:15:00 UTC  (20260812T101500Z)
 Context   : prod-gpu
 Namespace : mistral
 
@@ -29,6 +29,16 @@ Namespace : mistral
    TENSOR_PARALLEL_SIZE=4
    MAX_MODEL_LEN=32768
 
+-- Metrics -----------------------------------------------------------
+  top nodes (CPU/mem):
+    node-a1b2c3d4   842m         5%     6144Mi          9%
+    node-e5f6a7b8   9210m        57%    72310Mi         56%
+    node-c9d0e1f2   8975m        56%    70112Mi         54%
+  top pods (first rows):
+    mistral-inference-engine-5c9d7-abcde   main   6420m        68210Mi
+    mistral-inference-engine-7f2a1-fghij   main   6180m        67540Mi
+  serving /metrics: captured for 1 pod(s) (see metrics/serving/)
+
 -- Red flags ---------------------------------------------------------
   none detected (no OOMKills, CrashLoops, image-pull errors, high restarts)
 
@@ -38,7 +48,7 @@ Namespace : mistral
   workload  ok
   state     ok
   logs      ok
-  metrics   partial  (kubectl top pods unavailable (metrics-server not installed))
+  metrics   ok       (top nodes ok; top pods ok; serving /metrics ok (1 pod(s)))
 
 -- Privacy -----------------------------------------------------------
   redaction      : ON

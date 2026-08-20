@@ -24,7 +24,7 @@
     { "name": "workload", "status": "ok", "note": "" },
     { "name": "state", "status": "ok", "note": "" },
     { "name": "logs", "status": "ok", "note": "" },
-    { "name": "metrics", "status": "partial", "note": "kubectl top pods unavailable (metrics-server not installed)" }
+    { "name": "metrics", "status": "ok", "note": "top nodes ok; top pods ok; serving /metrics ok (1 pod(s))" }
   ],
   "redaction": {
     "applied": true,
