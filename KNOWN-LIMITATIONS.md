@@ -3,7 +3,7 @@
 This tool is deliberately conservative and auditable rather than clever. The
 primary privacy controls are **not collecting** secrets in the first place and
 **wiping environment-variable values at collection time**. The regex pass
-(`build_redaction_sed` in `mistral-support-bundle.sh`) is a defence-in-depth
+(`build_redaction_sed` in `mistral-furball.sh`) is a defence-in-depth
 *backstop*, not the main defence. That backstop has real limits — documented
 here so operators inspect bundles with the right expectations.
 

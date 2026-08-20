@@ -1,5 +1,5 @@
 {
-  "tool": "mistral-support-bundle",
+  "tool": "mistral-furball",
   "tool_version": "0.1.0",
   "generated_at_utc": "2026-08-12T10:15:00Z",
   "kubectl_client_version": "v1.29.4",

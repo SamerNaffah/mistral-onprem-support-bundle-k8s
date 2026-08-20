@@ -1,11 +1,11 @@
-# mistral-support-bundle
+# mistral-furball
 
 A single, dependency-light Bash script that collects a **read-only, redacted
 diagnostic bundle** from a Kubernetes cluster running a Mistral LLM deployment.
 It produces one local archive you can attach to a support ticket — with **no
 cluster mutation, no upload, and no telemetry**.
 
-- One file: `mistral-support-bundle.sh`. No install, no runtime dependencies
+- One file: `mistral-furball.sh`. No install, no runtime dependencies
   beyond `kubectl` and a POSIX shell.
 - Targets **bash 3.2+** (works on stock macOS) and `set -u` safe.
 - Everything in the bundle is plain text or JSON. Inspect it before you send it.
@@ -94,11 +94,11 @@ run the script in place:
 ```bash
 git clone https://github.com/SamerNaffah/mistral-onprem-support-bundle-k8s.git
 cd mistral-onprem-support-bundle-k8s
-chmod +x mistral-support-bundle.sh   # if needed
-./mistral-support-bundle.sh --help
+chmod +x mistral-furball.sh   # if needed
+./mistral-furball.sh --help
 ```
 
-For an air-gapped host, copy `mistral-support-bundle.sh` across on any medium you
+For an air-gapped host, copy `mistral-furball.sh` across on any medium you
 already trust and run it there — the redaction patterns are inline, so there is
 a single file and nothing to fetch at runtime.
 
@@ -106,16 +106,16 @@ a single file and nothing to fetch at runtime.
 
 ```bash
 # Simplest: auto-detect the GPU namespace, write a .zip to the current dir
-./mistral-support-bundle.sh
+./mistral-furball.sh
 
 # Target a namespace and output path
-./mistral-support-bundle.sh -n mistral -o ./bundles/
+./mistral-furball.sh -n mistral -o ./bundles/
 
 # Preview what would be collected, without contacting the cluster
-./mistral-support-bundle.sh --dry-run
+./mistral-furball.sh --dry-run
 
 # Extra privacy for sharing outside your org
-./mistral-support-bundle.sh -n mistral --anonymize-names --redact-ips
+./mistral-furball.sh -n mistral --anonymize-names --redact-ips
 ```
 
 ### Flags
@@ -133,7 +133,7 @@ a single file and nothing to fetch at runtime.
 | `-y, --yes` | Skip the interactive context confirmation (non-interactive use). |
 | `-h, --help` | Show help. |
 
-Output archive is named `mistral-support-bundle-<context>-<UTC-timestamp>.zip`
+Output archive is named `mistral-furball-<context>-<UTC-timestamp>.zip`
 (falls back to `.tar.gz` if `zip` is unavailable).
 
 ## Safety model
@@ -146,11 +146,11 @@ Output archive is named `mistral-support-bundle-<context>-<UTC-timestamp>.zip`
   read it before it leaves your machine:
 
   ```bash
-  unzip -l mistral-support-bundle-<context>-<timestamp>.zip      # list contents
-  unzip -p mistral-support-bundle-<context>-<timestamp>.zip \
+  unzip -l mistral-furball-<context>-<timestamp>.zip      # list contents
+  unzip -p mistral-furball-<context>-<timestamp>.zip \
         '*/SUMMARY.txt'                                          # read the summary
   # or, for the tar.gz fallback:
-  tar -tzf mistral-support-bundle-<context>-<timestamp>.tar.gz
+  tar -tzf mistral-furball-<context>-<timestamp>.tar.gz
   ```
 
   Start with `SUMMARY.txt` and `redaction-summary.txt`, then grep the extracted
@@ -177,7 +177,7 @@ including a generated `SUMMARY.txt`, `README-INSIDE.txt`, and `manifest.json`.
 bash test/redaction-test.sh
 ```
 
-The harness sources the script in library-only mode (`MSB_LIB_ONLY=1`) and
+The harness sources the script in library-only mode (`MFB_LIB_ONLY=1`) and
 exercises the redaction and anonymization functions without contacting a
 cluster.
 
