@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Redaction test harness for mistral-support-bundle.sh
+# Redaction test harness for mistral-furball.sh
 #
-# Sources the main script in library-only mode (MSB_LIB_ONLY=1), plants files
+# Sources the main script in library-only mode (MFB_LIB_ONLY=1), plants files
 # containing fake secrets into a throwaway BUNDLE_DIR, runs the real redaction
 # functions, and asserts that:
 #   - a <REDACTED...> marker was inserted for each secret shape, and
@@ -15,10 +15,10 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MAIN="$SCRIPT_DIR/../mistral-support-bundle.sh"
+MAIN="$SCRIPT_DIR/../mistral-furball.sh"
 
 # --- source the library ----------------------------------------------------
-export MSB_LIB_ONLY=1
+export MFB_LIB_ONLY=1
 # shellcheck disable=SC1090
 . "$MAIN"
 

@@ -1,7 +1,7 @@
-mistral-support-bundle v0.1.0 — what is in this bundle
+mistral-furball v0.1.0 — what is in this bundle
 ====================================================
 
-This archive was produced by mistral-support-bundle, a READ-ONLY diagnostic
+This archive was produced by mistral-furball, a READ-ONLY diagnostic
 collector for Mistral LLM deployments on Kubernetes. It is meant to be
 attached to a support ticket. Everything in it is plain text or JSON —
 open it and inspect it before you send it.

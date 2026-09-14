@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# mistral-support-bundle.sh
+# mistral-furball.sh
 #
 # Collects a read-only diagnostic bundle from a Kubernetes cluster running a
 # Mistral LLM deployment, redacts sensitive data, and writes a single local
@@ -39,7 +39,7 @@
 
 set -u
 
-TOOL_NAME="mistral-support-bundle"
+TOOL_NAME="mistral-furball"
 TOOL_VERSION="0.1.0"
 
 # ---------------------------------------------------------------------------
@@ -1782,7 +1782,7 @@ main() {
 
 # Source guard: allow the test harness to source this file for its functions
 # (globals + collectors + redaction) WITHOUT running a collection. Set
-# MSB_LIB_ONLY=1, or source it (BASH_SOURCE != $0), to load-only.
-if [ "${MSB_LIB_ONLY:-0}" != "1" ] && [ "${BASH_SOURCE:-$0}" = "$0" ]; then
+# MFB_LIB_ONLY=1, or source it (BASH_SOURCE != $0), to load-only.
+if [ "${MFB_LIB_ONLY:-0}" != "1" ] && [ "${BASH_SOURCE:-$0}" = "$0" ]; then
     main "$@"
 fi

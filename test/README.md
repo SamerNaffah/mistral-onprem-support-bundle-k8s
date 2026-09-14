@@ -1,6 +1,6 @@
 # Tests
 
-Offline, no-cluster tests for `mistral-support-bundle.sh`.
+Offline, no-cluster tests for `mistral-furball.sh`.
 
 ## Run
 
@@ -13,7 +13,7 @@ Output is TAP-ish (`ok N - ...` / `not ok N - ...`).
 
 ## What `redaction-test.sh` covers
 
-It sources the main script in **library-only mode** (`MSB_LIB_ONLY=1`, honored
+It sources the main script in **library-only mode** (`MFB_LIB_ONLY=1`, honored
 by the source guard at the bottom of the script) so the redaction functions can
 be called directly without contacting a cluster or running a collection. It then
 plants files containing **fake** secrets into a throwaway bundle dir and asserts:

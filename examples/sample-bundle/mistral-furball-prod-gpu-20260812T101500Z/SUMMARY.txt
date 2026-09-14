@@ -1,4 +1,4 @@
-mistral-support-bundle v0.1.0 — support bundle summary
+mistral-furball v0.1.0 — support bundle summary
 ====================================================
 
 Generated : 2026-08-12 10:15:00 UTC  (20260812T101500Z)

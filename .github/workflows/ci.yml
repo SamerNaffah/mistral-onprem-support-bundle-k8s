@@ -20,7 +20,7 @@ jobs:
           shellcheck --version
           # Fail only on real errors; the script is a large, mature bash 3.2
           # target and intentionally carries some style-level warnings.
-          shellcheck --severity=error mistral-support-bundle.sh test/redaction-test.sh
+          shellcheck --severity=error mistral-furball.sh test/redaction-test.sh
 
   test:
     name: Redaction tests (${{ matrix.os }})
