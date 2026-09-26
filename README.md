@@ -33,8 +33,11 @@ A run is a short, linear pipeline — every step is read-only and local:
 1. **Preflight.** Verify `kubectl` is present and the cluster is reachable,
    detect optional tools (`helm`/`jq`/`zip`), then echo the current context and
    ask you to confirm before touching anything (skip with `-y`).
-2. **Resolve namespace.** Use `-n`, or auto-detect namespaces whose pods request
-   `nvidia.com/gpu` and prompt you to pick one.
+2. **Resolve namespace.** Use `-n`, or resolve automatically: the default
+   namespace `mistral-ai-suite` when it exists, otherwise namespaces whose pods
+   request `nvidia.com/gpu` (prompting you to pick one when there are several),
+   otherwise the namespace set on the current context. A GPU namespace is never
+   required — CPU-only deployments work the same way.
 3. **Collect** into a temporary working directory: `cluster/`, `gpu/`,
    `workload/`, `state/`, `logs/`, `metrics/`. Each collector is best-effort — a
    failure is recorded in `manifest.json` and the run continues, so a partial
@@ -52,8 +55,11 @@ A run is a short, linear pipeline — every step is read-only and local:
 ```
 cluster/    kubectl + Kubernetes versions, nodes, storage classes, distro/CNI hints
 gpu/        GPU node labels/capacity, device plugin, GPU Operator, nvidia-smi, DCGM
+            (auto-skipped on a CPU-only cluster)
 workload/   serving Deployment/StatefulSet spec, images, resources, engine args,
-            referenced ConfigMaps, Helm values
+            referenced ConfigMaps, Helm values. GPU workloads are documented
+            first; when the namespace has none, every Deployment/StatefulSet
+            is documented instead (capped at 25)
 state/      namespace events, pod/container status, OOMKill/CrashLoop detection
 logs/       bounded recent logs (current + previous containers)
 metrics/    kubectl top nodes/pods, serving /metrics (best-effort)
@@ -105,11 +111,14 @@ a single file and nothing to fetch at runtime.
 ## Usage
 
 ```bash
-# Simplest: auto-detect the GPU namespace, write a .zip to the current dir
+# Simplest: use the default namespace (mistral-ai-suite), write a .zip here
 ./mistral-furball.sh
 
 # Target a namespace and output path
 ./mistral-furball.sh -n mistral -o ./bundles/
+
+# CPU-only namespace with many components: document all of them, not just 25
+./mistral-furball.sh -n mistral-ai-suite --max-workloads 0
 
 # Preview what would be collected, without contacting the cluster
 ./mistral-furball.sh --dry-run
@@ -122,10 +131,11 @@ a single file and nothing to fetch at runtime.
 
 | Flag | Description |
 | --- | --- |
-| `-n, --namespace <ns>` | Target namespace. If omitted, GPU workloads are auto-detected and you are prompted to choose. |
+| `-n, --namespace <ns>` | Target namespace. Defaults to `mistral-ai-suite` when it exists; otherwise GPU workloads are auto-detected (you are prompted when there are several), otherwise the current context's namespace. No GPU required. |
 | `-o, --output <path>` | Output directory, or explicit file ending in `.zip` / `.tar.gz`. Default: current directory. |
 | `--since <dur>` | Log window for `kubectl logs` (default: `1h`). |
 | `--tail <n>` | Max log lines per container (default: `500`). |
+| `--max-workloads <n>` | Max Deployments/StatefulSets documented in detail (default: `25`, `0` = no limit). Only bites in namespaces with no GPU workload, where every workload is a candidate. |
 | `--anonymize-names` | Consistently hash node/pod/namespace names. Off by default. |
 | `--redact-ips` | Also redact IPv4 addresses. Off by default. |
 | `--no-redact` | **Disable** the redaction pass. Discouraged; only for debugging the tool. Prints a loud warning. |

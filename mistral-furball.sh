@@ -46,6 +46,8 @@ TOOL_VERSION="0.1.0"
 # Defaults / globals
 # ---------------------------------------------------------------------------
 
+DEFAULT_NAMESPACE="mistral-ai-suite"   # used when -n is omitted and it exists
+
 NAMESPACE=""                 # -n/--namespace; auto-detected if empty
 OUTPUT_PATH="$PWD"           # -o/--output; dir or explicit .zip/.tar.gz path
 SINCE="1h"                   # --since; log window
@@ -55,6 +57,7 @@ REDACT_IPS=false             # --redact-ips (IPv4 addresses; off by default)
 REDACT=true                  # --no-redact flips this (discouraged)
 DRY_RUN=false                # --dry-run
 ASSUME_YES=false             # -y/--yes; skip interactive confirmation
+WORKLOAD_MAX=25              # --max-workloads; 0 = no limit
 
 HAVE_HELM=false
 HAVE_JQ=false
@@ -138,9 +141,12 @@ Usage:
   $(basename "$0") [flags]
 
 Flags:
-  -n, --namespace <ns>    Target namespace. If omitted, namespaces with GPU
-                          workloads (pods requesting nvidia.com/gpu) are
-                          auto-detected and you are prompted to choose.
+  -n, --namespace <ns>    Target namespace. If omitted: '$DEFAULT_NAMESPACE'
+                          is used when it exists, otherwise namespaces with
+                          GPU workloads (pods requesting nvidia.com/gpu) are
+                          auto-detected and you are prompted to choose, and
+                          failing that the current context's namespace is used.
+                          A GPU namespace is NOT required.
   -o, --output <path>     Output directory, or explicit file path ending in
                           .zip / .tar.gz. Default: current directory.
       --since <dur>       Log window for kubectl logs (default: $SINCE).
@@ -151,6 +157,11 @@ Flags:
                           usually help troubleshooting).
       --no-redact         DISABLE the redaction pass. Discouraged; only for
                           debugging this tool itself. Prints a loud warning.
+      --max-workloads <n> Max Deployments/StatefulSets documented in detail
+                          (default: $WORKLOAD_MAX, 0 = no limit). Only bites in
+                          namespaces without a GPU workload, where every
+                          workload is a candidate. Every workload is listed
+                          with its images in state/ regardless.
       --dry-run           Show what would be collected and exit. Does not
                           contact the cluster.
   -y, --yes               Skip the interactive context confirmation
@@ -196,6 +207,12 @@ parse_args() {
                 REDACT=false; shift ;;
             --dry-run)
                 DRY_RUN=true; shift ;;
+            --max-workloads)
+                require_value "$1" "${2:-}"
+                case "$2" in
+                    ''|*[!0-9]*) die "--max-workloads expects a non-negative integer (0 = no limit), got: $2" ;;
+                esac
+                WORKLOAD_MAX="$2"; shift 2 ;;
             -y|--yes)
                 ASSUME_YES=true; shift ;;
             -h|--help)
@@ -258,15 +275,33 @@ preflight() {
 # ---------------------------------------------------------------------------
 
 detect_namespace() {
-    # Find namespaces containing pods that request nvidia.com/gpu (read-only).
-    log "No namespace given — scanning for GPU workloads (pods requesting nvidia.com/gpu)..."
+    # Resolution order (a GPU namespace is never required):
+    #   1. the default namespace '$DEFAULT_NAMESPACE', when it exists
+    #   2. namespaces running GPU workloads (prompt if several)
+    #   3. the namespace set on the current kubectl context
+    # All steps are read-only.
+    if kc get namespace "$DEFAULT_NAMESPACE" >/dev/null 2>&1; then
+        NAMESPACE="$DEFAULT_NAMESPACE"
+        log "No namespace given — using default namespace: $NAMESPACE"
+        return 0
+    fi
+
+    log "No namespace given — default '$DEFAULT_NAMESPACE' not found; scanning for GPU workloads..."
     local ns_list
     ns_list="$(kubectl get pods --all-namespaces \
         -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.spec.containers[*].resources.limits.nvidia\.com/gpu}{"\n"}{end}' \
         2>/dev/null | awk -F'\t' '$2 != "" { print $1 }' | sort -u)"
 
     if [ -z "$ns_list" ]; then
-        die "no GPU workloads found in any namespace. Specify one with -n <namespace>."
+        # No GPU anywhere — fall back to whatever the current context points at.
+        local ctx_ns
+        ctx_ns="$(kubectl config view --minify -o jsonpath='{..namespace}' 2>/dev/null)"
+        if [ -n "$ctx_ns" ]; then
+            NAMESPACE="$ctx_ns"
+            log "  no GPU workloads found — using the current context's namespace: $NAMESPACE"
+            return 0
+        fi
+        die "could not determine a namespace: '$DEFAULT_NAMESPACE' does not exist, no GPU workloads were found, and the current context sets no namespace. Specify one with -n <namespace>."
     fi
 
     local count
@@ -448,32 +483,53 @@ write_cni_hints() {
 # DCGM metrics. nvidia-smi uses a READ-ONLY exec (query tool, changes
 # nothing); DCGM uses a read-only GET through the API server's pod proxy.
 # Everything beyond node labels is best-effort — never fails the run.
+#
+# GPU is OPTIONAL. On a CPU-only cluster (or a namespace with no GPU workload)
+# this collector records "no GPU detected" and returns ok — it never fails the
+# run and never blocks the rest of the bundle.
 # ===========================================================================
 
 GPU_NOTES=""
+GPU_NODE_COUNT=0        # nodes advertising nvidia.com/gpu (set by write_gpu_node_info)
 
 gpu_note() { GPU_NOTES="${GPU_NOTES:+$GPU_NOTES; }$1"; }
 
 collect_gpu() {
     CAPTURE_FAILS=0
     GPU_NOTES=""
+    GPU_NODE_COUNT=0
 
     # Working file only — the full cluster pod list stays OUT of the bundle
     # (it would leak names of unrelated workloads). Only GPU-stack-filtered
     # lines are included below.
     local all_pods="$WORK_DIR/all-pods-wide.txt"
+    local gpu_stack_pods=0
     kc get pods --all-namespaces -o wide > "$all_pods" 2>>"$ERRLOG" || true
 
     write_gpu_node_info
 
-    grep -iE 'nvidia|dcgm|gpu-operator|gpu-feature-discovery|node-feature-discovery' \
-        "$all_pods" > "$BUNDLE_DIR/gpu/gpu-stack-pods.txt" 2>/dev/null \
-        || echo "no NVIDIA / GPU Operator / NFD pods found" > "$BUNDLE_DIR/gpu/gpu-stack-pods.txt"
+    if grep -iE 'nvidia|dcgm|gpu-operator|gpu-feature-discovery|node-feature-discovery' \
+            "$all_pods" > "$BUNDLE_DIR/gpu/gpu-stack-pods.txt" 2>/dev/null; then
+        gpu_stack_pods=1
+    else
+        echo "no NVIDIA / GPU Operator / NFD pods found" > "$BUNDLE_DIR/gpu/gpu-stack-pods.txt"
+    fi
 
     collect_device_plugin "$all_pods"
     collect_gpu_operator
-    collect_nvidia_smi "$all_pods"
-    collect_dcgm_metrics "$all_pods"
+
+    if [ "$GPU_NODE_COUNT" -eq 0 ] && [ "$gpu_stack_pods" -eq 0 ]; then
+        # CPU-only cluster: no node advertises nvidia.com/gpu and no NVIDIA /
+        # DCGM pod exists. Probing nvidia-smi and DCGM would only waste time.
+        echo "no GPU detected in this cluster — nvidia-smi skipped" \
+            > "$BUNDLE_DIR/gpu/nvidia-smi.txt"
+        echo "no GPU detected in this cluster — DCGM metrics skipped" \
+            > "$BUNDLE_DIR/gpu/dcgm-metrics.txt"
+        gpu_note "no GPU detected (CPU-only cluster) — GPU probes skipped"
+    else
+        collect_nvidia_smi "$all_pods"
+        collect_dcgm_metrics "$all_pods"
+    fi
 
     if [ "$CAPTURE_FAILS" -eq 0 ]; then
         record_collector gpu ok "$GPU_NOTES"
@@ -508,6 +564,7 @@ write_gpu_node_info() {
         echo "node list unavailable" > "$out"
         CAPTURE_FAILS=$((CAPTURE_FAILS + 1))
     fi
+    GPU_NODE_COUNT="$gpu_nodes"
     gpu_note "$gpu_nodes node(s) with nvidia.com/gpu capacity"
 }
 
@@ -651,30 +708,82 @@ NATS_URL TRITON_CACHE_DIR RCLONE_CONFIG_PATH
 PORT HOST
 "
 
+# WORKLOAD_MAX (set above, overridable with --max-workloads) caps how many
+# workloads are documented in detail. It matters in the CPU/non-GPU fallback
+# path, where a busy namespace can hold a hundred Deployments/StatefulSets and
+# each one costs several API calls. The full inventory — every workload with
+# its images — is always in state/workloads-wide.txt regardless of this cap.
+
+# Ranking used ONLY in the non-GPU fallback path, to decide which workloads get
+# documented in detail when the namespace holds more than WORKLOAD_MAX of them.
+# Serving engines first, then application components, then infrastructure.
+WORKLOAD_SERVING_RE='vllm|inference|engine|serving|triton|tgi|sglang|model|embed|rerank|ocr|transcribe|audio'
+WORKLOAD_INFRA_RE='pooler|operator|webhook|keda|redis|valkey|nats|kafka|zookeeper|etcd|clickhouse|keeper|postgres|pgbouncer|mysql|mongo|temporal|signoz|grafana|prometheus|otel|opentelemetry|collector|vector|alloy|loki|tempo|mimir|vespa|keycloak|barman|minio|rustfs|cert-manager|external-dns|nginx|traefik|sandbox|nack'
+
 WL_NOTES=""
+WL_SELECTION=""      # "gpu" | "all" — how the workload list below was chosen
+WL_PRIMARY_LABEL=""  # directory name of the highest-ranked workload (SUMMARY)
 
 collect_workload() {
     CAPTURE_FAILS=0
     WL_NOTES=""
-    local wl_list count=0 kind name label
+    local wl_list count=0 kind name label total kindlabel
 
     # Release-level context first (independent of workload auto-detection).
     collect_helm
 
+    # GPU workloads first (the inference engine on a GPU cluster). If there are
+    # none — CPU-only cluster, or a namespace holding only the control-plane
+    # services — fall back to every Deployment/StatefulSet in the namespace.
+    WL_SELECTION="gpu"
     wl_list="$(find_gpu_workloads)"
+    if [ -z "$wl_list" ]; then
+        WL_SELECTION="all"
+        wl_list="$(find_all_workloads | rank_workloads)"
+    fi
 
     if [ -z "$wl_list" ]; then
-        # No GPU Deployment/StatefulSet found. Record what workloads DO exist
-        # (names only — safe) so support still has a starting point.
         {
-            echo "# No Deployment/StatefulSet requesting nvidia.com/gpu was found"
-            echo "# in namespace '$NAMESPACE'. Workloads present (names only):"
+            echo "# No Deployment or StatefulSet was found in namespace '$NAMESPACE'."
+            echo "# Other workloads present (names only):"
             echo
-            kc get deployment,statefulset,daemonset -n "$NAMESPACE" -o name 2>>"$ERRLOG"
-        } > "$BUNDLE_DIR/workload/no-gpu-workload.txt"
-        WL_NOTES="no GPU workload auto-detected in $NAMESPACE"
+            kc get daemonset,job,cronjob -n "$NAMESPACE" -o name 2>>"$ERRLOG"
+        } > "$BUNDLE_DIR/workload/no-workload.txt"
+        WL_NOTES="no Deployment/StatefulSet found in $NAMESPACE"
         record_collector workload partial "$WL_NOTES"
         return 0
+    fi
+
+    total="$(printf '%s\n' "$wl_list" | grep -c '[^[:space:]]')"
+    if [ "$WORKLOAD_MAX" -gt 0 ] && [ "$total" -gt "$WORKLOAD_MAX" ]; then
+        {
+            echo "# $total Deployment/StatefulSet workloads found in namespace '$NAMESPACE';"
+            echo "# only the first $WORKLOAD_MAX (highest-ranked, see README.txt) are"
+            echo "# documented in detail. Re-run with --max-workloads 0 for all of them."
+            echo "# Full list, in the order they were ranked:"
+            echo
+            printf '%s\n' "$wl_list" | awk -v n="$WORKLOAD_MAX" \
+                '{ printf "%s %s %s\n", (NR<=n ? "[detailed]" : "[listed  ]"), $1, $2 }'
+            echo
+            echo "# Every workload — including the ones only listed here — appears with"
+            echo "# its images in state/workloads-wide.txt."
+        } > "$BUNDLE_DIR/workload/workloads-truncated.txt"
+        wl_list="$(printf '%s\n' "$wl_list" | head -"$WORKLOAD_MAX")"
+    fi
+
+    if [ "$WL_SELECTION" = "all" ]; then
+        {
+            echo "# No Deployment/StatefulSet requesting nvidia.com/gpu was found in"
+            echo "# namespace '$NAMESPACE' (this is expected on a CPU-only deployment),"
+            echo "# so plain Deployments/StatefulSets were documented instead."
+            echo "#"
+            echo "# When the namespace holds more than $WORKLOAD_MAX of them, they are ranked"
+            echo "# before being cut: likely serving components first, then other"
+            echo "# application components, then infrastructure (databases, operators,"
+            echo "# connection poolers, telemetry). The ranking is a name heuristic — it"
+            echo "# decides ORDER only, never what exists. See workloads-truncated.txt for"
+            echo "# the full ranked list and state/workloads-wide.txt for every workload."
+        } > "$BUNDLE_DIR/workload/README.txt"
     fi
 
     # bash 3.2: iterate via while-read over a heredoc (no mapfile).
@@ -682,6 +791,7 @@ collect_workload() {
         [ -n "$name" ] || continue
         count=$((count + 1))
         label="$(printf '%s-%s' "$kind" "$name" | tr -c 'A-Za-z0-9._-' '-')"
+        [ "$count" -eq 1 ] && WL_PRIMARY_LABEL="$label"
         write_workload_spec   "$kind" "$name" "$label"
         write_workload_env    "$kind" "$name" "$label"
         collect_workload_refs "$kind" "$name" "$label"
@@ -690,7 +800,8 @@ collect_workload() {
 $wl_list
 EOF
 
-    WL_NOTES="$count GPU workload(s): $(printf '%s\n' "$wl_list" | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')"
+    [ "$WL_SELECTION" = "gpu" ] && kindlabel="GPU workload(s)" || kindlabel="workload(s), no GPU request"
+    WL_NOTES="$count $kindlabel: $(printf '%s\n' "$wl_list" | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')"
     if [ "$CAPTURE_FAILS" -eq 0 ]; then
         record_collector workload ok "$WL_NOTES"
     else
@@ -708,6 +819,32 @@ find_gpu_workloads() {
             2>>"$ERRLOG" \
         | awk -F'\t' -v k="$kind" '($2 != "" || $3 != "") { print k, $1 }'
     done
+}
+
+find_all_workloads() {
+    # Fallback for CPU-only / non-GPU namespaces: every Deployment and
+    # StatefulSet in $NAMESPACE, as "<kind> <name>". Read-only.
+    local kind
+    for kind in deployment statefulset; do
+        kc get "$kind" -n "$NAMESPACE" -o name 2>>"$ERRLOG" \
+        | sed -e 's|^[^/]*/||' -e "s|^|$kind |"
+    done
+}
+
+rank_workloads() {
+    # Stable-sort "<kind> <name>" lines on stdin into three tiers by name:
+    #   1 likely serving component, 2 other application component,
+    #   3 infrastructure (database, operator, pooler, telemetry, ...).
+    # Order only — nothing is dropped here. Used when the namespace has no GPU
+    # workload to point at, so that a cut at WORKLOAD_MAX keeps the useful ones.
+    awk -v serving="$WORKLOAD_SERVING_RE" -v infra="$WORKLOAD_INFRA_RE" '
+        {
+            n = tolower($2); tier = 2;
+            if (n ~ serving) tier = 1;
+            if (n ~ infra)   tier = 3;   # a pooler/operator stays infra
+            printf "%d\t%06d\t%s\n", tier, NR, $0;
+        }
+    ' | sort -k1,1n -k2,2n | cut -f3-
 }
 
 write_workload_spec() {
@@ -1098,18 +1235,30 @@ collect_top() {
 collect_serving_metrics() {
     local out_dir="$BUNDLE_DIR/metrics/serving"
     local cands="$WORK_DIR/serving-metrics-candidates.txt"
-    local ns pod scraped=0 tried=0 max_tries=3
+    local running="$WORK_DIR/serving-metrics-running-pods.txt"
+    local ns pod gpu_cands scraped=0 tried=0 max_tries
 
-    # Candidate serving pods = running GPU pods in the target namespace (the
-    # inference engine). Same detection as gpu/ nvidia-smi.
+    # Candidate pods, best first: running GPU pods (the inference engine on a
+    # GPU cluster), then every other running pod in the namespace — a CPU-only
+    # deployment still exposes Prometheus /metrics. De-duplicated, order kept.
     kc get pods -n "$NAMESPACE" \
         -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.spec.containers[*].resources.limits.nvidia\.com/gpu}{"\n"}{end}' \
-        2>>"$ERRLOG" | awk '$3 != "" { print $1, $2 }' > "$cands"
+        2>>"$ERRLOG" > "$running"
+    {
+        awk '$3 != "" { print $1, $2 }' "$running"
+        awk '$3 == "" && $2 != "" { print $1, $2 }' "$running"
+    } | awk '!seen[$0]++' > "$cands"
+
+    # With GPU pods the first few candidates are the serving engine, so a small
+    # budget suffices. Without them we are probing ordinary pods and need more
+    # attempts to reach the component that actually exposes /metrics.
+    gpu_cands="$(awk '$3 != ""' "$running" | grep -c '[^[:space:]]')"
+    if [ "$gpu_cands" -gt 0 ]; then max_tries=3; else max_tries=10; fi
 
     if [ ! -s "$cands" ]; then
-        echo "no running GPU (serving) pod found in namespace $NAMESPACE — serving /metrics skipped" \
+        echo "no running pod found in namespace $NAMESPACE — serving /metrics skipped" \
             > "$BUNDLE_DIR/metrics/serving-metrics.txt"
-        metrics_note "no serving pod for /metrics"
+        metrics_note "no running pod for /metrics"
         return 0
     fi
 
@@ -1124,7 +1273,7 @@ collect_serving_metrics() {
     done < "$cands"
 
     if [ "$scraped" -eq 0 ]; then
-        echo "GPU pod(s) found but no Prometheus /metrics endpoint responded ($tried tried). Not fatal — the serving engine may not expose /metrics, or it is on an unprobed port." \
+        echo "Running pod(s) found but no Prometheus /metrics endpoint responded ($tried tried). Not fatal — the serving engine may not expose /metrics, or it is on an unprobed port." \
             > "$out_dir/UNAVAILABLE.txt"
         metrics_note "serving /metrics unavailable ($tried tried)"
     else
@@ -1553,7 +1702,7 @@ write_readme_inside() {
 
 write_summary() {
     local out="$BUNDLE_DIR/SUMMARY.txt"
-    local node_count=0 gpu_count=0 distro="unknown" wl_spec hits
+    local node_count=0 gpu_count=0 distro="unknown" wl_spec hits wl_count=0
 
     if [ -f "$BUNDLE_DIR/cluster/nodes-wide.txt" ]; then
         node_count="$(grep -cvE '^NAME|^[[:space:]]*$' "$BUNDLE_DIR/cluster/nodes-wide.txt" 2>/dev/null)"
@@ -1570,7 +1719,21 @@ write_summary() {
         distro="${distro:-unknown}"
     fi
 
-    wl_spec="$(ls "$BUNDLE_DIR"/workload/*/spec-summary.txt 2>/dev/null | head -1)"
+    # Highlight the workload the collector ranked first (the GPU/serving one
+    # when there is one). Fall back to alphabetical order if that directory is
+    # gone — e.g. renamed by --anonymize-names.
+    # One directory per documented workload (workload/helm/ is not one).
+    local d
+    for d in "$BUNDLE_DIR"/workload/*/; do
+        [ -f "$d/spec-summary.txt" ] && wl_count=$((wl_count + 1))
+    done
+
+    wl_spec=""
+    if [ -n "$WL_PRIMARY_LABEL" ] && [ -f "$BUNDLE_DIR/workload/$WL_PRIMARY_LABEL/spec-summary.txt" ]; then
+        wl_spec="$BUNDLE_DIR/workload/$WL_PRIMARY_LABEL/spec-summary.txt"
+    else
+        wl_spec="$(ls "$BUNDLE_DIR"/workload/*/spec-summary.txt 2>/dev/null | head -1)"
+    fi
 
     {
         echo "$TOOL_NAME v$TOOL_VERSION — support bundle summary"
@@ -1585,10 +1748,17 @@ write_summary() {
         echo "  kubernetes (srv) : ${KUBE_SERVER_VERSION:-unknown}"
         echo "  distro hint      : $distro"
         echo "  nodes            : $node_count"
-        echo "  GPU nodes        : $gpu_count (advertising nvidia.com/gpu)"
+        if [ "$gpu_count" -gt 0 ]; then
+            echo "  GPU nodes        : $gpu_count (advertising nvidia.com/gpu)"
+        else
+            echo "  GPU nodes        : 0 (CPU-only cluster — GPU probes skipped)"
+        fi
         echo
         echo "-- Workload / serving config -----------------------------------------"
         if [ -n "$wl_spec" ] && [ -f "$wl_spec" ]; then
+            if [ "$wl_count" -gt 1 ]; then
+                echo "  $wl_count workloads documented in workload/ — highest-ranked shown here:"
+            fi
             grep -E '^(kind|name|helm chart|replicas)' "$wl_spec" 2>/dev/null | sed 's/^/  /'
             echo "  images:"
             awk '/^\[images\]/{f=1;next} /^\[/{f=0} f && NF && $0 !~ /init\//{print "   "$0}' "$wl_spec" 2>/dev/null | head -4
@@ -1596,7 +1766,7 @@ write_summary() {
             hits="$(grep -iE 'tensor.parallel|max.model.len|quantization|dtype|gpu.memory.util|kv.cache|max.num.(seqs|batched)' "$wl_spec" 2>/dev/null | sed 's/^[[:space:]]*/   /' | head -12)"
             if [ -n "$hits" ]; then printf '%s\n' "$hits"; else echo "   (none matched — see workload/*/spec-summary.txt)"; fi
         else
-            echo "  no GPU workload spec captured (see workload/)."
+            echo "  no workload spec captured (see workload/)."
         fi
         echo
         echo "-- Metrics -----------------------------------------------------------"
@@ -1619,7 +1789,7 @@ write_summary() {
         elif [ -f "$BUNDLE_DIR/metrics/serving/UNAVAILABLE.txt" ]; then
             echo "  serving /metrics: unavailable (no Prometheus endpoint responded)"
         elif [ -f "$BUNDLE_DIR/metrics/serving-metrics.txt" ]; then
-            echo "  serving /metrics: skipped (no running GPU/serving pod)"
+            echo "  serving /metrics: skipped (no running pod to probe)"
         else
             echo "  serving /metrics: not collected"
         fi
@@ -1720,9 +1890,10 @@ dry_run_plan() {
 DRY RUN — nothing will be collected, the cluster will not be contacted.
 
   context    : $KUBE_CONTEXT (from local kubeconfig)
-  namespace  : ${NAMESPACE:-<auto-detect GPU namespaces at runtime>}
+  namespace  : ${NAMESPACE:-<resolved at runtime: '$DEFAULT_NAMESPACE' if it exists, else a GPU namespace, else the context namespace>}
   output     : $OUTPUT_PATH
   log window : --since $SINCE, --tail $TAIL_LINES
+  workloads  : detail for up to $([ "$WORKLOAD_MAX" -eq 0 ] && echo "all" || echo "$WORKLOAD_MAX") Deployment(s)/StatefulSet(s)
   redaction  : $($REDACT && echo "ON (regex safety net + env-value wipe)" || echo "OFF (--no-redact)")
   anonymize  : $ANONYMIZE_NAMES (node/pod/namespace names)
   redact-ips : $REDACT_IPS
@@ -1732,7 +1903,9 @@ Planned bundle tree (all commands read-only):
   cluster/    kubectl version; get/describe nodes; storage classes
   gpu/        GPU node labels; nvidia-device-plugin + GPU Operator status/logs;
               best-effort read-only exec of nvidia-smi; DCGM /metrics
-  workload/   serving Deployment/StatefulSet spec (env values wiped);
+              (skipped automatically on a CPU-only cluster)
+  workload/   serving Deployment/StatefulSet spec (env values wiped); GPU
+              workloads first, otherwise every Deployment/StatefulSet;
               serving-engine config (TP size, max-model-len, quant, ...);
               helm list/values/manifest (redacted)$($HAVE_HELM || echo " [SKIPPED: helm missing]")
   state/      namespace events; pod status; OOMKilled/CrashLoop detection

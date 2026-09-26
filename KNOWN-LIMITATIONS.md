@@ -71,6 +71,11 @@ inside it). Limits:
 - **GPU vendor coverage.** GPU collection targets NVIDIA (GPU Operator / Node
   Feature Discovery labels, `nvidia.com/gpu`). Other accelerators are not
   covered.
+- **GPU is optional, but GPU-less detection is heuristic.** With no
+  `nvidia.com/gpu` workload in the namespace, the tool documents *every*
+  Deployment/StatefulSet instead (capped at 25) and probes ordinary pods for a
+  Prometheus `/metrics` endpoint. It cannot tell which of them is "the" serving
+  component, so the extract is broader and less targeted than on a GPU cluster.
 - **Serving-config extraction is tuned for the `mistral-inference-engine`
   chart.** Non-standard deployments may surface fewer parsed values (the raw
   spec is still collected).
